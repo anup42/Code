@@ -1,0 +1,94 @@
+import os
+import argparse
+import tensorflow as tf
+
+from yolo11_tf.model import build_yolo11
+from yolo11_tf.data import build_dataset
+from yolo11_tf.losses import YoloLoss
+
+
+def parse_args():
+    ap = argparse.ArgumentParser("Train YOLO11-TF on YOLO-format data")
+    ap.add_argument("--data", type=str, required=True, help="Path to data.yaml")
+    ap.add_argument("--imgsz", type=int, default=640)
+    ap.add_argument("--batch", type=int, default=16)
+    ap.add_argument("--epochs", type=int, default=100)
+    ap.add_argument("--workers", type=int, default=4)
+    ap.add_argument("--weights", type=str, default=None, help="Optional checkpoint to resume")
+    ap.add_argument("--model_scale", type=str, default="n", choices=["n","s","m","l","x"], help="Model size multiplier")
+    ap.add_argument("--lr", type=float, default=1e-3)
+    ap.add_argument("--out", type=str, default="runs/train/exp")
+    return ap.parse_args()
+
+
+def scale_to_multipliers(scale: str):
+    table = {
+        "n": (0.50, 0.33),
+        "s": (0.75, 0.50),
+        "m": (1.00, 0.67),
+        "l": (1.25, 1.00),
+        "x": (1.50, 1.00),
+    }
+    return table.get(scale, (0.50, 0.33))
+
+
+def main():
+    args = parse_args()
+    os.makedirs(args.out, exist_ok=True)
+
+    train_ds, num_classes = build_dataset(args.data, imgsz=args.imgsz, batch_size=args.batch, split="train", shuffle=True)
+    val_ds, _ = build_dataset(args.data, imgsz=args.imgsz, batch_size=args.batch, split="val", shuffle=False)
+
+    width_mult, depth_mult = scale_to_multipliers(args.model_scale)
+    model = build_yolo11(num_classes=num_classes, width_mult=width_mult, depth_mult=depth_mult)
+
+    if args.weights and os.path.exists(args.weights):
+        model.load_weights(args.weights)
+
+    # Wrap model with custom training via multiple outputs and a single loss
+    loss_fn = YoloLoss(num_classes=num_classes)
+
+    # Use a custom training step through compile with loss and loss_weights per output
+    # Keras requires mapping y_true/y_pred – we’ll pack outputs into a list
+    class MultiOutModel(tf.keras.Model):
+        def __init__(self, base, loss_fn):
+            super().__init__()
+            self.base = base
+            self.loss_fn = loss_fn
+
+        def call(self, x, training=False):
+            return self.base(x, training=training)
+
+        def train_step(self, data):
+            images, targets = data
+            with tf.GradientTape() as tape:
+                preds = self(images, training=True)
+                loss = self.loss_fn(targets, preds)
+            grads = tape.gradient(loss, self.trainable_variables)
+            self.optimizer.apply_gradients(zip(grads, self.trainable_variables))
+            return {"loss": loss}
+
+        def test_step(self, data):
+            images, targets = data
+            preds = self(images, training=False)
+            loss = self.loss_fn(targets, preds)
+            return {"loss": loss}
+
+    wrapper = MultiOutModel(model, loss_fn)
+    optimizer = tf.keras.optimizers.Adam(learning_rate=args.lr)
+    wrapper.compile(optimizer=optimizer)
+
+    ckpt_path = os.path.join(args.out, "weights.weights.h5")
+    cbs = [
+        tf.keras.callbacks.ModelCheckpoint(ckpt_path, save_weights_only=True, save_best_only=True, monitor="val_loss", mode="min"),
+        tf.keras.callbacks.TensorBoard(log_dir=os.path.join(args.out, "tb"))
+    ]
+
+    wrapper.fit(train_ds, validation_data=val_ds, epochs=args.epochs, callbacks=cbs)
+
+    # Save final
+    wrapper.save_weights(os.path.join(args.out, "last.weights.h5"))
+
+
+if __name__ == "__main__":
+    main()
