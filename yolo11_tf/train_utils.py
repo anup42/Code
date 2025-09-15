@@ -39,6 +39,26 @@ class Trainer:
             return tf.gather_nd(x, indices)
 
     @staticmethod
+    def _assert_indices_in_range(idx: tf.Tensor, upper: tf.Tensor, name: str = "idx"):
+        """Assert that all indices are in [0, upper). No-op outside tf.function eager errors.
+        Returns idx with control dependencies so downstream ops run after checks.
+        """
+        idx = tf.convert_to_tensor(idx)
+        upper = tf.convert_to_tensor(upper)
+        checks = []
+        # Only check if there are any elements
+        numel = tf.size(idx)
+        def add_checks():
+            checks_local = [
+                tf.debugging.assert_non_negative(idx, message=f"{name} has negative values"),
+                tf.debugging.assert_less(idx, upper, message=f"{name} contains values >= upper bound"),
+            ]
+            return checks_local
+        checks = tf.cond(numel > 0, lambda: add_checks(), lambda: [])
+        with tf.control_dependencies(checks if isinstance(checks, (list, tuple)) else [checks]):
+            return tf.identity(idx)
+
+    @staticmethod
     def _build_grids_from_outputs(outputs: Dict):
         # Already provided per forward pass
         return outputs["grids"], outputs["strides"]
@@ -194,6 +214,9 @@ class Trainer:
                 HW = tf.shape(cls_map)[1]
                 C = tf.shape(cls_map)[2]
 
+                # Sanity: grid size should match HW
+                tf.debugging.assert_equal(tf.shape(pts)[0], HW, message="Grid HW mismatch against head output")
+
                 mask = idx >= 0  # [B, maxb]
                 num_pos = tf.reduce_sum(tf.cast(mask, tf.float32)) + 1e-9
                 total_pos += num_pos
@@ -208,6 +231,8 @@ class Trainer:
                     # Compute linear indices on CPU for stability
                     with tf.device('/CPU:0'):
                         lin_idx = tf.gather_nd(idx, tf.stack([b_idx, g_idx], axis=1))  # [M]
+                    # Validate index range
+                    lin_idx = self._assert_indices_in_range(lin_idx, HW, name="lin_idx")
                     pred_cls_sel = self._gather_cpu(cls_map, b_idx)
                     pred_cls_sel = self._gather_cpu(pred_cls_sel, lin_idx, batch_dims=1)  # [M, C]
 
@@ -294,6 +319,8 @@ class Trainer:
                     cls_oh_pos = tf.one_hot(cls_ids_pos, depth=C)
                     # Predicted boxes for selected points (DFL decode)
                     bins = self.cfg.reg_max + 1
+                    # Validate point indices for head map
+                    n_pos = self._assert_indices_in_range(n_pos, HW, name="n_pos")
                     pred_reg_pts = self._gather_cpu(reg_map, b_pos)
                     pred_reg_pts = self._gather_cpu(pred_reg_pts, n_pos, batch_dims=1)  # [M, 4*(R)]
                     pred_reg_pts = tf.reshape(pred_reg_pts, [-1, 4, bins])
@@ -325,16 +352,23 @@ class Trainer:
                     # Optional: keep top-K points by IoU to limit compute
                     # Run top-k on CPU to avoid GPU scatter/segment kernels in gradients
                     with tf.device('/CPU:0'):
-                        Kp = tf.minimum(tf.shape(iou_w)[0], tf.constant(4096, dtype=tf.int32))
-                        top_vals, top_idx = tf.math.top_k(iou_w, k=Kp)
+                        M = tf.shape(iou_w)[0]
+                        Kp = tf.minimum(M, tf.constant(4096, dtype=tf.int32))
+                        def _do_topk():
+                            return tf.math.top_k(iou_w, k=Kp)
+                        def _empty():
+                            return tf.zeros([0], dtype=iou_w.dtype), tf.zeros([0], dtype=tf.int32)
+                        top_vals, top_idx = tf.cond(M > 0, _do_topk, _empty)
                     i_sel = top_idx
                     w = top_vals  # [Kp]
                     # Gather predictions for selected points
                     pred_cls_pts = self._gather_cpu(self._gather_cpu(cls_map, b_pos), i_sel, batch_dims=0)
-                    pred_cls_pts = self._gather_cpu(pred_cls_pts, tf.gather(n_pos, i_sel), batch_dims=1)
+                    n_pos_sel = tf.gather(n_pos, i_sel)
+                    n_pos_sel = self._assert_indices_in_range(n_pos_sel, HW, name="n_pos_sel")
+                    pred_cls_pts = self._gather_cpu(pred_cls_pts, n_pos_sel, batch_dims=1)
                     cls_oh_sel = tf.gather(cls_oh_pos, i_sel)
                     pred_obj_pts = self._gather_cpu(self._gather_cpu(obj_map, b_pos), i_sel, batch_dims=0)
-                    pred_obj_pts = self._gather_cpu(pred_obj_pts, tf.gather(n_pos, i_sel), batch_dims=1)
+                    pred_obj_pts = self._gather_cpu(pred_obj_pts, n_pos_sel, batch_dims=1)
                     # Weighted classification/objectness losses
                     cls_loss_pts = bce_with_logits_loss(pred_cls_pts, cls_oh_sel)
                     cls_loss_pts = tf.reduce_sum(cls_loss_pts * w[:, None]) / (tf.reduce_sum(w) + 1e-9)
@@ -363,6 +397,8 @@ class Trainer:
                 # Run top-k on CPU as well
                 with tf.device('/CPU:0'):
                     _, neg_idx = tf.math.top_k(scores, k=K)
+                # Validate negative sample indices
+                _ = self._assert_indices_in_range(neg_idx, HW, name="neg_idx")
                 pred_neg_cls = self._gather_cpu(cls_map, neg_idx, batch_dims=1)  # [B, K, C]
                 zero_tgt = tf.zeros_like(pred_neg_cls)
                 neg_ce = bce_with_logits_loss(pred_neg_cls, zero_tgt)
