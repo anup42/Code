@@ -213,7 +213,9 @@ class Trainer:
                 g_idx = tf.cast(g_idx, tf.int32)
                 lin_idx = tf.zeros([0], dtype=tf.int32)
                 if tf.shape(b_idx)[0] > 0:
-                    lin_idx = tf.gather_nd(idx, tf.stack([b_idx, g_idx], axis=1))  # [M]
+                    # Compute linear indices on CPU to avoid XLA/GPU segment kernels in gradients
+                    with tf.device('/CPU:0'):
+                        lin_idx = tf.gather_nd(idx, tf.stack([b_idx, g_idx], axis=1))  # [M]
                     pred_cls_sel = self._gather_cpu(cls_map, b_idx)
                     pred_cls_sel = self._gather_cpu(pred_cls_sel, lin_idx, batch_dims=1)  # [M, C]
 
