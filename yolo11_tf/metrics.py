@@ -90,18 +90,17 @@ def decode_maps_to_dets_np(pred, conf_thres=0.25, iou_thres=0.5, max_det=300, im
             x2 = pts[:, 0] + d[:, 2]
             y2 = pts[:, 1] + d[:, 3]
             boxes = np.stack([x1 / img_w, y1 / img_h, x2 / img_w, y2 / img_h], axis=-1)
-            # class scores and a soft objectness proxy = max class prob
+            # class scores
             scores_c = 1.0 / (1.0 + np.exp(-cls_all[b]))  # [N,C]
-            obj = scores_c.max(axis=1)  # [N]
-            # prefilter by top-K objectness to reduce FPs and speed up
-            topk = min(max_det * 10, scores_c.shape[0])
-            top_idx = np.argpartition(-obj, kth=topk - 1)[:topk]
+            # light prefilter: keep many candidates to avoid dropping TPs early
+            topk = min(max_det * 50, scores_c.shape[0])
+            max_cls = scores_c.max(axis=1)
+            top_idx = np.argpartition(-max_cls, kth=topk - 1)[:topk]
             boxes_f = boxes[top_idx]
             scores_c_f = scores_c[top_idx]
-            obj_f = obj[top_idx]
             dets_b = []
             for c in range(C):
-                sc = scores_c_f[:, c] * obj_f  # joint score
+                sc = scores_c_f[:, c]
                 mask = sc >= conf_thres
                 if not np.any(mask):
                     continue
