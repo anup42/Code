@@ -59,7 +59,7 @@ def main():
 
     train_ds, num_classes = build_trainer_dataset(args.data, imgsz=args.imgsz, batch_size=args.batch, split="train", shuffle=True)
     val_ds, _ = build_trainer_dataset(args.data, imgsz=args.imgsz, batch_size=args.batch, split="val", shuffle=False)
-    # Steps per epoch for progress bar
+    # Steps per epoch
     train_dir, val_dir, _ = load_yolo_yaml(args.data)
     train_files = build_file_list(train_dir)
     val_files = build_file_list(val_dir)
@@ -85,7 +85,7 @@ def main():
     cfg = TrainConfig(num_classes=num_classes, img_size=args.imgsz, reg_max=16, lr=args.lr)
     trainer = Trainer(model, cfg)
 
-    # TensorBoard writer for charts
+    # TensorBoard writer for charts (kept)
     tb_dir = os.path.join(args.out, "tb")
     writer = tf.summary.create_file_writer(tb_dir)
 
@@ -93,27 +93,29 @@ def main():
         print(f"Epoch {epoch+1}/{args.epochs}")
         t0 = time.time()
         seen = 0
-        pb = tf.keras.utils.Progbar(steps_per_epoch, stateful_metrics=["loss","cls","box","dfl","obj","pos"], unit_name="batch")
         for step, (images, targets) in enumerate(train_ds, start=1):
             try:
                 seen += int(images.shape[0])
             except Exception:
                 pass
             metrics = trainer.train_step(images, targets)
-            if step <= steps_per_epoch:
-                pb.update(step, values=[
-                    ("loss", metrics['loss']), ("cls", metrics['cls']), ("box", metrics['box']), ("dfl", metrics['dfl']), ("obj", metrics.get('obj', 0.0)), ("pos", metrics['pos'])
-                ])
+            # Periodic logging instead of progress bar
+            if (step % max(1, int(args.log_every)) == 0) or step == 1:
+                print(
+                    f"step {step}/{steps_per_epoch} "
+                    f"loss={float(metrics['loss']):.3f} cls={float(metrics['cls']):.3f} box={float(metrics['box']):.3f} "
+                    f"dfl={float(metrics['dfl']):.3f} obj={float(metrics.get('obj', 0.0)):.3f} pos={float(metrics['pos']):.1f}",
+                    flush=True,
+                )
             if step >= steps_per_epoch:
                 break
         # Evaluate PR/mAP with progress bar on validation
         print("Validating...")
-        pb_val = tf.keras.utils.Progbar(steps_per_val, stateful_metrics=["p","r","mAP50","mAP50-95"], unit_name="val")
         # Optionally limit val_ds to args.val_steps using take()
         val_iter = val_ds.take(steps_per_val) if steps_per_val else val_ds
         p, r, m50, m5095 = evaluate_dataset_pr_maps_fast(
             model, val_iter, num_classes, conf_thres=0.001, iou_thres=0.5, max_det=300, imgsz=args.imgsz,
-            progbar=pb_val, total_steps=steps_per_val,
+            progbar=None, total_steps=None,
         )
         dt = time.time() - t0
         ips = (seen / dt) if dt > 0 else 0.0

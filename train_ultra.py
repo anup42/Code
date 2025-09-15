@@ -56,7 +56,7 @@ def main():
     # Datasets
     train_ds, num_classes = build_trainer_dataset(args.data, imgsz=args.imgsz, batch_size=args.batch, split="train", shuffle=True)
     val_ds, _ = build_trainer_dataset(args.data, imgsz=args.imgsz, batch_size=args.batch, split="val", shuffle=False)
-    # Steps per epoch for progress bar
+    # Steps per epoch
     from yolo11_tf.data import load_yolo_yaml, build_file_list
     train_dir, val_dir, _ = load_yolo_yaml(args.data)
     train_files = build_file_list(train_dir)
@@ -83,17 +83,19 @@ def main():
         t0 = time.time()
         seen = 0
         # Train epoch
-        pb = tf.keras.utils.Progbar(steps_per_epoch, stateful_metrics=["loss","cls","box","dfl","pos"], unit_name="batch")
         for step, (images, targets) in enumerate(train_ds, start=1):
             try:
                 seen += int(images.shape[0])
             except Exception:
                 pass
             metrics = trainer.train_step(images, targets)
-            if step <= steps_per_epoch:
-                pb.update(step, values=[
-                    ("loss", metrics['loss']), ("cls", metrics['cls']), ("box", metrics['box']), ("dfl", metrics['dfl']), ("pos", metrics['pos'])
-                ])
+            if (step % max(1, int(args.log_every)) == 0) or step == 1:
+                print(
+                    f"step {step}/{steps_per_epoch} "
+                    f"loss={float(metrics['loss']):.3f} cls={float(metrics['cls']):.3f} box={float(metrics['box']):.3f} "
+                    f"dfl={float(metrics['dfl']):.3f} pos={float(metrics['pos']):.1f}",
+                    flush=True,
+                )
             if step >= steps_per_epoch:
                 break
         # Eval quick metrics at epoch end (mAP@0.5 on val)
