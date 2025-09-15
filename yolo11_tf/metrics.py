@@ -106,7 +106,14 @@ def decode_maps_to_dets_np(pred, conf_thres=0.25, iou_thres=0.5, max_det=300) ->
                 if keep.size > 0:
                     kept = np.concatenate([b_c[keep], s_c[keep, None], np.full((keep.size, 1), c, dtype=np.float32)], axis=1)
                     dets_b.append(kept)
-            outs[b] = np.vstack(dets_b) if dets_b else np.zeros((0, 6), dtype=np.float32)
+            if dets_b:
+                merged = np.vstack(dets_b)
+                if merged.shape[0] > max_det:
+                    idx = np.argpartition(-merged[:, 4], kth=max_det - 1)[:max_det]
+                    merged = merged[idx]
+                outs[b] = merged
+            else:
+                outs[b] = np.zeros((0, 6), dtype=np.float32)
         return outs
 
     # Legacy xywh+obj list of maps
