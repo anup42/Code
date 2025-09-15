@@ -17,6 +17,7 @@ def parse_args():
     ap.add_argument("--model_scale", type=str, default="n", choices=["n","s","m","l","x"])
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--out", type=str, default="runs/train_ultra/exp")
+    ap.add_argument("--log_every", type=int, default=20, help="Print train metrics every N steps")
     return ap.parse_args()
 
 
@@ -34,6 +35,21 @@ def scale_to_multipliers(scale: str):
 def main():
     args = parse_args()
     os.makedirs(args.out, exist_ok=True)
+    # Enable GPU memory growth to avoid full allocation
+    try:
+        gpus = tf.config.list_physical_devices('GPU')
+        if gpus:
+            for gpu in gpus:
+                try:
+                    tf.config.experimental.set_memory_growth(gpu, True)
+                except Exception:
+                    pass
+            print(f"Using {len(gpus)} GPU(s) with memory growth enabled", flush=True)
+        else:
+            print("No GPU found, running on CPU", flush=True)
+    except Exception as e:
+        print(f"GPU setup warning: {e}", flush=True)
+    import time
 
     # Datasets
     train_ds, num_classes = build_trainer_dataset(args.data, imgsz=args.imgsz, batch_size=args.batch, split="train", shuffle=True)
@@ -49,14 +65,33 @@ def main():
 
     # Simple training loop
     for epoch in range(args.epochs):
+        t0 = time.time()
+        seen = 0
         # Train epoch
-        for images, targets in train_ds:
+        for step, (images, targets) in enumerate(train_ds, start=1):
+            try:
+                seen += int(images.shape[0])
+            except Exception:
+                pass
             metrics = trainer.train_step(images, targets)
+            if step % max(1, args.log_every) == 0:
+                print(
+                    f"Epoch {epoch+1}/{args.epochs} | step {step:4d} | "
+                    f"loss={metrics['loss']:.3f} cls={metrics['cls']:.3f} "
+                    f"box={metrics['box']:.3f} dfl={metrics['dfl']:.3f} pos={metrics['pos']:.1f}",
+                    flush=True,
+                )
         # Eval quick metrics at epoch end (mAP@0.5 on val)
         p, r, m = evaluate_dataset_map50(model, val_ds.map(lambda img, tgt: ((img, tf.zeros([tf.shape(tgt)[0], cfg.max_boxes, 5], dtype=tf.float32)), tgt)), num_classes, conf_thres=0.05, iou_thres=0.5)
+        dt = time.time() - t0
+        ips = (seen / dt) if dt > 0 else 0.0
+        print(
+            f"Epoch {epoch+1}/{args.epochs} done in {dt:.1f}s ({ips:.1f} img/s) - "
+            f"last_loss={metrics['loss']:.3f}  P={p:.4f} R={r:.4f} mAP50={m:.4f}",
+            flush=True,
+        )
         print(f"Epoch {epoch+1}/{args.epochs} — loss={metrics['loss']:.2f}  P={p:.4f} R={r:.4f} mAP50={m:.4f}")
 
 
 if __name__ == "__main__":
     main()
-

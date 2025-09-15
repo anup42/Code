@@ -66,17 +66,20 @@ def decode_maps_to_dets_np(pred, conf_thres=0.25, iou_thres=0.5, max_det=300) ->
         cls_all = np.concatenate(cls_list, axis=1)  # [B,N,C]
         reg_all = np.concatenate(reg_list, axis=1)  # [B,N,4*bins]
         grid_all = np.concatenate(grids, axis=0)    # [N,2]
-        # Decode distances via integral
+        # Build stride per point aligned with concatenation
+        stride_vec = np.concatenate([np.full((g.shape[0],), float(strides[i]), dtype=np.float32) for i, g in enumerate(grids)], axis=0)  # [N]
+        # Decode distances via integral and scale by stride to pixel units
         bins = reg_all.shape[-1] // 4
         reg_reshaped = reg_all.reshape([B, -1, 4, bins])
         dist = integral_distribution(tf.convert_to_tensor(reg_reshaped), bins - 1).numpy()  # [B,N,4]
-        # Convert to xyxy in pixels then normalize by assumed imgsz (max grid * stride)
-        # Infer scale from grid range
-        img_w = max(1.0, float(grid_all[:, 0].max() * 2.0))
-        img_h = max(1.0, float(grid_all[:, 1].max() * 2.0))
+        dist_pix = dist * stride_vec[None, :, None]  # [B,N,4]
+        # Convert to xyxy in pixels then normalize by inferred image size from grid range
+        min_stride = float(min(strides)) if hasattr(strides, '__iter__') else float(strides)
+        img_w = float((grid_all[:, 0].max() - grid_all[:, 0].min()) + min_stride)
+        img_h = float((grid_all[:, 1].max() - grid_all[:, 1].min()) + min_stride)
         for b in range(B):
             pts = grid_all  # [N,2]
-            d = dist[b]
+            d = dist_pix[b]
             x1 = pts[:, 0] - d[:, 0]
             y1 = pts[:, 1] - d[:, 1]
             x2 = pts[:, 0] + d[:, 2]
