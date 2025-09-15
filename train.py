@@ -18,6 +18,7 @@ def parse_args():
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--out", type=str, default="runs/train/exp")
     ap.add_argument("--log_every", type=int, default=20, help="Print train metrics every N steps")
+    ap.add_argument("--cache", action="store_true", help="Cache training dataset in memory for speed (small datasets)")
     return ap.parse_args()
 
 
@@ -60,6 +61,12 @@ def main():
     train_dir, _, _ = load_yolo_yaml(args.data)
     train_files = build_file_list(train_dir)
     steps_per_epoch = max(1, len(train_files) // args.batch)
+    # Optional cache and non-deterministic order for throughput
+    if hasattr(args, 'cache') and getattr(args, 'cache'):
+        train_ds = train_ds.cache()
+    opt = tf.data.Options()
+    opt.deterministic = False
+    train_ds = train_ds.with_options(opt)
 
     width_mult, depth_mult = scale_to_multipliers(args.model_scale)
     model = build_yolo11(num_classes=num_classes, width_mult=width_mult, depth_mult=depth_mult)
