@@ -241,7 +241,7 @@ class Trainer:
                     obj_pos_loss = tf.reduce_mean(bce_with_logits_loss(pred_obj_pos, obj_pos_tgt))
                     total_obj += obj_pos_loss
 
-                # Center-radius assignment for extra cls/obj positives
+                # Center-radius assignment for extra cls/obj positives with IoU weighting (task-aligned)
                 r = tf.constant(2.5, dtype=tf.float32)
                 radius_pix = r * stride
                 # Prepare targets fields
@@ -271,7 +271,6 @@ class Trainer:
                 allow = tf.logical_and(allow, d_all <= radius_pix)
                 big = tf.constant(1e9, dtype=d_all.dtype)
                 d_masked = tf.where(allow, d_all, tf.fill(tf.shape(d_all), big))
-                min_d = tf.reduce_min(d_masked, axis=1)  # [B,N]
                 any_ok = tf.reduce_any(allow, axis=1)  # [B,N]
                 gt_choice = tf.argmin(d_masked, axis=1, output_type=tf.int32)  # [B,N]
                 pos_pairs = tf.where(any_ok)  # [M,2] (b, n)
@@ -283,18 +282,51 @@ class Trainer:
                     # class one-hot
                     cls_ids_pos = tf.gather_nd(t_cls_full, gi)
                     cls_oh_pos = tf.one_hot(cls_ids_pos, depth=C)
-                    # weights by center distance
-                    w = tf.gather_nd(min_d, pos_pairs) / (radius_pix + 1e-6)
-                    w = tf.exp(-tf.square(w))  # [M]
-                    # classification positive loss at additional points
-                    pred_cls_pts = tf.gather(cls_map, b_pos)
-                    pred_cls_pts = tf.gather(pred_cls_pts, n_pos, batch_dims=1)  # [M,C]
-                    cls_loss_pts = bce_with_logits_loss(pred_cls_pts, cls_oh_pos)
+                    # Predicted boxes for selected points (DFL decode)
+                    bins = self.cfg.reg_max + 1
+                    pred_reg_pts = tf.gather(reg_map, b_pos)
+                    pred_reg_pts = tf.gather(pred_reg_pts, n_pos, batch_dims=1)  # [M, 4*(R)]
+                    pred_reg_pts = tf.reshape(pred_reg_pts, [-1, 4, bins])
+                    dist_bins = integral_distribution(pred_reg_pts, self.cfg.reg_max) * stride  # [M,4]
+                    pxy = tf.gather(pts, n_pos)  # [M,2]
+                    px1 = pxy[:, 0] - dist_bins[:, 0]
+                    py1 = pxy[:, 1] - dist_bins[:, 1]
+                    px2 = pxy[:, 0] + dist_bins[:, 2]
+                    py2 = pxy[:, 1] + dist_bins[:, 3]
+                    pbox = tf.stack([px1, py1, px2, py2], axis=-1)  # [M,4]
+                    # GT boxes for selected pairs
+                    gx1 = tf.gather_nd(tf.squeeze(tx1, -1), gi)
+                    gy1 = tf.gather_nd(tf.squeeze(ty1, -1), gi)
+                    gx2 = tf.gather_nd(tf.squeeze(tx2, -1), gi)
+                    gy2 = tf.gather_nd(tf.squeeze(ty2, -1), gi)
+                    gbox = tf.stack([gx1, gy1, gx2, gy2], axis=-1)
+                    # IoU weights
+                    inter_x1 = tf.maximum(pbox[:, 0], gbox[:, 0])
+                    inter_y1 = tf.maximum(pbox[:, 1], gbox[:, 1])
+                    inter_x2 = tf.minimum(pbox[:, 2], gbox[:, 2])
+                    inter_y2 = tf.minimum(pbox[:, 3], gbox[:, 3])
+                    iw = tf.maximum(0.0, inter_x2 - inter_x1)
+                    ih = tf.maximum(0.0, inter_y2 - inter_y1)
+                    inter = iw * ih
+                    area_p = tf.maximum(0.0, (pbox[:, 2] - pbox[:, 0])) * tf.maximum(0.0, (pbox[:, 3] - pbox[:, 1]))
+                    area_g = tf.maximum(0.0, (gbox[:, 2] - gbox[:, 0])) * tf.maximum(0.0, (gbox[:, 3] - gbox[:, 1]))
+                    union = area_p + area_g - inter + 1e-9
+                    iou_w = inter / union  # [M]
+                    # Optional: keep top-K points by IoU to limit compute
+                    Kp = tf.minimum(tf.shape(iou_w)[0], tf.constant(4096, dtype=tf.int32))
+                    top_vals, top_idx = tf.math.top_k(iou_w, k=Kp)
+                    i_sel = top_idx
+                    w = top_vals  # [Kp]
+                    # Gather predictions for selected points
+                    pred_cls_pts = tf.gather(tf.gather(cls_map, b_pos), i_sel, batch_dims=0)
+                    pred_cls_pts = tf.gather(pred_cls_pts, tf.gather(n_pos, i_sel), batch_dims=1)
+                    cls_oh_sel = tf.gather(cls_oh_pos, i_sel)
+                    pred_obj_pts = tf.gather(tf.gather(obj_map, b_pos), i_sel, batch_dims=0)
+                    pred_obj_pts = tf.gather(pred_obj_pts, tf.gather(n_pos, i_sel), batch_dims=1)
+                    # Weighted classification/objectness losses
+                    cls_loss_pts = bce_with_logits_loss(pred_cls_pts, cls_oh_sel)
                     cls_loss_pts = tf.reduce_sum(cls_loss_pts * w[:, None]) / (tf.reduce_sum(w) + 1e-9)
                     total_cls += cls_loss_pts
-                    # objectness positive at additional points
-                    pred_obj_pts = tf.gather(obj_map, b_pos)
-                    pred_obj_pts = tf.gather(pred_obj_pts, n_pos, batch_dims=1)  # [M,1]
                     obj_pos_loss2 = tf.reduce_sum(bce_with_logits_loss(pred_obj_pts, tf.ones_like(pred_obj_pts)) * w[:, None]) / (tf.reduce_sum(w) + 1e-9)
                     total_obj += obj_pos_loss2
 
