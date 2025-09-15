@@ -1,5 +1,7 @@
 import os
 import argparse
+# Disable XLA JIT at process start to avoid GPU UnsortedSegment crashes
+os.environ.setdefault("TF_XLA_FLAGS", "--tf_xla_auto_jit=0")
 import tensorflow as tf
 
 from yolo11_tf.model import build_yolo11

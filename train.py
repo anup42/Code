@@ -1,5 +1,6 @@
 ﻿import os
 import argparse
+os.environ.setdefault("TF_XLA_FLAGS", "--tf_xla_auto_jit=0")
 import tensorflow as tf
 
 from yolo11_tf.model import build_yolo11
