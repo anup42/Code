@@ -152,6 +152,7 @@ class Trainer:
 
         return pos_idx_list, pos_targ_list
 
+    @tf.function(experimental_relax_shapes=True)
     def train_step(self, images, targets):
         with tf.GradientTape() as tape:
             outputs = self.model(images, training=True)
@@ -227,16 +228,7 @@ class Trainer:
                     )
                     total_box += box_loss
 
-                # For inference metrics later
-                dist = integral_distribution(reg_map, self.cfg.reg_max) * stride
-                pts_b = tf.tile(pts[None, ...], [B, 1, 1])
-                x1 = pts_b[..., 0] - dist[..., 0]
-                y1 = pts_b[..., 1] - dist[..., 1]
-                x2 = pts_b[..., 0] + dist[..., 2]
-                y2 = pts_b[..., 1] + dist[..., 3]
-                decoded_boxes = tf.stack([x1, y1, x2, y2], axis=-1)  # [B, HW, 4]
-                decoded_boxes_all.append(decoded_boxes)
-                cls_scores_all.append(tf.sigmoid(cls_map))
+                # Skip expensive full decode during training; evaluation runs its own decode
 
             # combine losses
             loss = (
@@ -249,11 +241,11 @@ class Trainer:
         self.optimizer.apply_gradients(zip(grads, self.model.trainable_variables))
 
         return {
-            "loss": float(loss.numpy()),
-            "cls": float(total_cls.numpy()),
-            "box": float(total_box.numpy()),
-            "dfl": float(total_dfl.numpy()),
-            "pos": float(total_pos.numpy()),
+            "loss": tf.cast(loss, tf.float32),
+            "cls": tf.cast(total_cls, tf.float32),
+            "box": tf.cast(total_box, tf.float32),
+            "dfl": tf.cast(total_dfl, tf.float32),
+            "pos": tf.cast(total_pos, tf.float32),
         }
 
 

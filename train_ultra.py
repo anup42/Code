@@ -54,6 +54,11 @@ def main():
     # Datasets
     train_ds, num_classes = build_trainer_dataset(args.data, imgsz=args.imgsz, batch_size=args.batch, split="train", shuffle=True)
     val_ds, _ = build_trainer_dataset(args.data, imgsz=args.imgsz, batch_size=args.batch, split="val", shuffle=False)
+    # Steps per epoch for progress bar
+    from yolo11_tf.data import load_yolo_yaml, build_file_list
+    train_dir, _, _ = load_yolo_yaml(args.data)
+    train_files = build_file_list(train_dir)
+    steps_per_epoch = max(1, len(train_files) // args.batch)
 
     # Model
     width_mult, depth_mult = scale_to_multipliers(args.model_scale)
@@ -65,22 +70,23 @@ def main():
 
     # Simple training loop
     for epoch in range(args.epochs):
+        print(f"Epoch {epoch+1}/{args.epochs}")
         t0 = time.time()
         seen = 0
         # Train epoch
+        pb = tf.keras.utils.Progbar(steps_per_epoch, stateful_metrics=["loss","cls","box","dfl","pos"], unit_name="batch")
         for step, (images, targets) in enumerate(train_ds, start=1):
             try:
                 seen += int(images.shape[0])
             except Exception:
                 pass
             metrics = trainer.train_step(images, targets)
-            if step % max(1, args.log_every) == 0:
-                print(
-                    f"Epoch {epoch+1}/{args.epochs} | step {step:4d} | "
-                    f"loss={metrics['loss']:.3f} cls={metrics['cls']:.3f} "
-                    f"box={metrics['box']:.3f} dfl={metrics['dfl']:.3f} pos={metrics['pos']:.1f}",
-                    flush=True,
-                )
+            if step <= steps_per_epoch:
+                pb.update(step, values=[
+                    ("loss", metrics['loss']), ("cls", metrics['cls']), ("box", metrics['box']), ("dfl", metrics['dfl']), ("pos", metrics['pos'])
+                ])
+            if step >= steps_per_epoch:
+                break
         # Eval quick metrics at epoch end (mAP@0.5 on val)
         p, r, m = evaluate_dataset_map50(model, val_ds.map(lambda img, tgt: ((img, tf.zeros([tf.shape(tgt)[0], cfg.max_boxes, 5], dtype=tf.float32)), tgt)), num_classes, conf_thres=0.05, iou_thres=0.5, imgsz=args.imgsz)
         dt = time.time() - t0
