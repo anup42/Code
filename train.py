@@ -18,6 +18,8 @@ def parse_args():
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--out", type=str, default="runs/train/exp")
     ap.add_argument("--log_every", type=int, default=20, help="Print train metrics every N steps")
+    ap.add_argument("--steps_per_epoch", type=int, default=0, help="Override steps per epoch; if >0, run validation after N steps and increment epoch")
+    ap.add_argument("--val_steps", type=int, default=0, help="Optional cap on validation steps per epoch (0 = use full val set)")
     ap.add_argument("--cache", action="store_true", help="Cache training dataset in memory for speed (small datasets)")
     return ap.parse_args()
 
@@ -61,8 +63,15 @@ def main():
     train_dir, val_dir, _ = load_yolo_yaml(args.data)
     train_files = build_file_list(train_dir)
     val_files = build_file_list(val_dir)
-    steps_per_epoch = max(1, len(train_files) // args.batch)
+    estimated_steps = max(1, len(train_files) // args.batch)
+    steps_per_epoch = args.steps_per_epoch if args.steps_per_epoch and args.steps_per_epoch > 0 else estimated_steps
+    # If user requests more steps than available batches, repeat the dataset to supply enough batches
+    if steps_per_epoch > estimated_steps:
+        train_ds = train_ds.repeat()
+    # Validation steps
     steps_per_val = max(1, len(val_files) // args.batch)
+    if args.val_steps and args.val_steps > 0:
+        steps_per_val = args.val_steps
     # Optional cache and non-deterministic order for throughput
     if hasattr(args, 'cache') and getattr(args, 'cache'):
         train_ds = train_ds.cache()
@@ -100,8 +109,10 @@ def main():
         # Evaluate PR/mAP with progress bar on validation
         print("Validating...")
         pb_val = tf.keras.utils.Progbar(steps_per_val, stateful_metrics=["p","r","mAP50","mAP50-95"], unit_name="val")
+        # Optionally limit val_ds to args.val_steps using take()
+        val_iter = val_ds.take(steps_per_val) if steps_per_val else val_ds
         p, r, m50, m5095 = evaluate_dataset_pr_maps_fast(
-            model, val_ds, num_classes, conf_thres=0.001, iou_thres=0.5, max_det=300, imgsz=args.imgsz,
+            model, val_iter, num_classes, conf_thres=0.001, iou_thres=0.5, max_det=300, imgsz=args.imgsz,
             progbar=pb_val, total_steps=steps_per_val,
         )
         dt = time.time() - t0

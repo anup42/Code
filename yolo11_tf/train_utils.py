@@ -261,13 +261,13 @@ class Trainer:
                 # inside mask
                 pts_x = tf.expand_dims(pts_b[..., 0], axis=1)  # [B,1,N]
                 pts_y = tf.expand_dims(pts_b[..., 1], axis=1)
-                x1e = tf.expand_dims(tx1, axis=2)
-                y1e = tf.expand_dims(ty1, axis=2)
-                x2e = tf.expand_dims(tx2, axis=2)
-                y2e = tf.expand_dims(ty2, axis=2)
+                x1e = tx1  # [B,maxb,1]
+                y1e = ty1
+                x2e = tx2
+                y2e = ty2
                 inside = tf.logical_and(tf.logical_and(pts_x >= x1e, pts_x <= x2e),
                                          tf.logical_and(pts_y >= y1e, pts_y <= y2e))  # [B,maxb,N]
-                allow = tf.logical_and(inside, tf.expand_dims(tvalid, axis=2))
+                allow = tf.logical_and(inside, tvalid)
                 allow = tf.logical_and(allow, d_all <= radius_pix)
                 big = tf.constant(1e9, dtype=d_all.dtype)
                 d_masked = tf.where(allow, d_all, tf.fill(tf.shape(d_all), big))

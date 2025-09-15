@@ -18,6 +18,8 @@ def parse_args():
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--out", type=str, default="runs/train_ultra/exp")
     ap.add_argument("--log_every", type=int, default=20, help="Print train metrics every N steps")
+    ap.add_argument("--steps_per_epoch", type=int, default=0, help="Override steps per epoch; if >0, validate after N steps")
+    ap.add_argument("--val_steps", type=int, default=0, help="Optional cap on validation steps per epoch (0 = full val)")
     return ap.parse_args()
 
 
@@ -56,9 +58,16 @@ def main():
     val_ds, _ = build_trainer_dataset(args.data, imgsz=args.imgsz, batch_size=args.batch, split="val", shuffle=False)
     # Steps per epoch for progress bar
     from yolo11_tf.data import load_yolo_yaml, build_file_list
-    train_dir, _, _ = load_yolo_yaml(args.data)
+    train_dir, val_dir, _ = load_yolo_yaml(args.data)
     train_files = build_file_list(train_dir)
-    steps_per_epoch = max(1, len(train_files) // args.batch)
+    val_files = build_file_list(val_dir)
+    estimated_steps = max(1, len(train_files) // args.batch)
+    steps_per_epoch = args.steps_per_epoch if args.steps_per_epoch and args.steps_per_epoch > 0 else estimated_steps
+    if steps_per_epoch > estimated_steps:
+        train_ds = train_ds.repeat()
+    steps_per_val = max(1, len(val_files) // args.batch)
+    if args.val_steps and args.val_steps > 0:
+        steps_per_val = args.val_steps
 
     # Model
     width_mult, depth_mult = scale_to_multipliers(args.model_scale)
@@ -88,7 +97,8 @@ def main():
             if step >= steps_per_epoch:
                 break
         # Eval quick metrics at epoch end (mAP@0.5 on val)
-        p, r, m = evaluate_dataset_map50(model, val_ds.map(lambda img, tgt: ((img, tf.zeros([tf.shape(tgt)[0], cfg.max_boxes, 5], dtype=tf.float32)), tgt)), num_classes, conf_thres=0.05, iou_thres=0.5, imgsz=args.imgsz)
+        val_iter = val_ds.take(steps_per_val).map(lambda img, tgt: ((img, tf.zeros([tf.shape(tgt)[0], cfg.max_boxes, 5], dtype=tf.float32)), tgt))
+        p, r, m = evaluate_dataset_map50(model, val_iter, num_classes, conf_thres=0.05, iou_thres=0.5, imgsz=args.imgsz)
         dt = time.time() - t0
         ips = (seen / dt) if dt > 0 else 0.0
         print(
