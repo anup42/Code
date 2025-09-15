@@ -241,6 +241,63 @@ class Trainer:
                     obj_pos_loss = tf.reduce_mean(bce_with_logits_loss(pred_obj_pos, obj_pos_tgt))
                     total_obj += obj_pos_loss
 
+                # Center-radius assignment for extra cls/obj positives
+                r = tf.constant(2.5, dtype=tf.float32)
+                radius_pix = r * stride
+                # Prepare targets fields
+                t_cls_full = tf.cast(targets[..., 0], tf.int32)  # [B,maxb]
+                tx1 = targets[..., 1:2]
+                ty1 = targets[..., 2:3]
+                tx2 = targets[..., 3:4]
+                ty2 = targets[..., 4:5]
+                tvalid = targets[..., 5:6] > 0.5
+                # centers and distances
+                tcx = (tx1 + tx2) / 2.0
+                tcy = (ty1 + ty2) / 2.0
+                centers = tf.concat([tcx, tcy], axis=-1)  # [B,maxb,2]
+                pts_b = tf.tile(pts[None, ...], [B, 1, 1])  # [B,N,2]
+                diff = tf.expand_dims(pts_b, axis=1) - tf.expand_dims(centers, axis=2)  # [B,maxb,N,2]
+                d_all = tf.norm(diff, axis=-1)  # [B,maxb,N]
+                # inside mask
+                pts_x = tf.expand_dims(pts_b[..., 0], axis=1)  # [B,1,N]
+                pts_y = tf.expand_dims(pts_b[..., 1], axis=1)
+                x1e = tf.expand_dims(tx1, axis=2)
+                y1e = tf.expand_dims(ty1, axis=2)
+                x2e = tf.expand_dims(tx2, axis=2)
+                y2e = tf.expand_dims(ty2, axis=2)
+                inside = tf.logical_and(tf.logical_and(pts_x >= x1e, pts_x <= x2e),
+                                         tf.logical_and(pts_y >= y1e, pts_y <= y2e))  # [B,maxb,N]
+                allow = tf.logical_and(inside, tf.expand_dims(tvalid, axis=2))
+                allow = tf.logical_and(allow, d_all <= radius_pix)
+                big = tf.constant(1e9, dtype=d_all.dtype)
+                d_masked = tf.where(allow, d_all, tf.fill(tf.shape(d_all), big))
+                min_d = tf.reduce_min(d_masked, axis=1)  # [B,N]
+                any_ok = tf.reduce_any(allow, axis=1)  # [B,N]
+                gt_choice = tf.argmin(d_masked, axis=1, output_type=tf.int32)  # [B,N]
+                pos_pairs = tf.where(any_ok)  # [M,2] (b, n)
+                if tf.shape(pos_pairs)[0] > 0:
+                    b_pos = tf.cast(pos_pairs[:, 0], tf.int32)
+                    n_pos = tf.cast(pos_pairs[:, 1], tf.int32)
+                    g_pos = tf.gather_nd(gt_choice, pos_pairs)  # [M]
+                    gi = tf.stack([b_pos, g_pos], axis=1)
+                    # class one-hot
+                    cls_ids_pos = tf.gather_nd(t_cls_full, gi)
+                    cls_oh_pos = tf.one_hot(cls_ids_pos, depth=C)
+                    # weights by center distance
+                    w = tf.gather_nd(min_d, pos_pairs) / (radius_pix + 1e-6)
+                    w = tf.exp(-tf.square(w))  # [M]
+                    # classification positive loss at additional points
+                    pred_cls_pts = tf.gather(cls_map, b_pos)
+                    pred_cls_pts = tf.gather(pred_cls_pts, n_pos, batch_dims=1)  # [M,C]
+                    cls_loss_pts = bce_with_logits_loss(pred_cls_pts, cls_oh_pos)
+                    cls_loss_pts = tf.reduce_sum(cls_loss_pts * w[:, None]) / (tf.reduce_sum(w) + 1e-9)
+                    total_cls += cls_loss_pts
+                    # objectness positive at additional points
+                    pred_obj_pts = tf.gather(obj_map, b_pos)
+                    pred_obj_pts = tf.gather(pred_obj_pts, n_pos, batch_dims=1)  # [M,1]
+                    obj_pos_loss2 = tf.reduce_sum(bce_with_logits_loss(pred_obj_pts, tf.ones_like(pred_obj_pts)) * w[:, None]) / (tf.reduce_sum(w) + 1e-9)
+                    total_obj += obj_pos_loss2
+
                 # Background negative classification sampling to teach background separation
                 # Build [B, HW] mask of positive points
                 pos_points = tf.zeros([B, HW], dtype=tf.bool)
