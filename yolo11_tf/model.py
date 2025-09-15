@@ -151,7 +151,7 @@ def build_yolo11(num_classes, width_mult=0.50, depth_mult=0.33, reg_max=16):
     neck = build_neck([p3.shape[-1], p4.shape[-1], p5.shape[-1]], width_mult=width_mult, depth_mult=depth_mult)
     n3, n4, n5 = neck([p3, p4, p5])
 
-    head = DetectHeadDFL(num_classes, ch=(int(n3.shape[-1]), int(n4.shape[-1]), int(n5.shape[-1])), reg_max=reg_max, strides=(8, 16, 32))
+    head = DetectHeadDFL(num_classes, ch=(int(n3.shape[-1]), int(n4.shape[-1]), int(n5.shape[-1])), reg_max=reg_max, strides=(4, 8, 16))
 
     # Keras functional model can return dict; use subclass wrapper
     class Wrapper(keras.Model):
