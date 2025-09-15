@@ -3,6 +3,7 @@ from typing import List
 import numpy as np
 import tensorflow as tf
 from .losses import integral_distribution
+from .inference import YoloInferencer
 
 
 def _xywhn_to_xyxy_np(xywh: np.ndarray) -> np.ndarray:
@@ -353,6 +354,77 @@ def evaluate_dataset_pr_maps(model: tf.keras.Model, val_ds, num_classes: int,
                 h = (y2 - y1) / float(H)
                 gts_all.append(np.concatenate([cls, cx, cy, w, h], axis=1))
                 dets_all.append(dets[i])
+
+    p, r, map50 = compute_pr_map50(dets_all, gts_all, num_classes, iou_thres=0.5)
+    map5095 = compute_map50_95(dets_all, gts_all, num_classes)
+    return p, r, map50, map5095
+
+
+def evaluate_dataset_pr_maps_fast(model: tf.keras.Model, val_ds, num_classes: int,
+                                  conf_thres=0.25, iou_thres=0.5, max_det=300, imgsz: int | None = None,
+                                  progbar=None, total_steps: int | None = None):
+    """Faster evaluation using YoloInferencer + combined_nms and optional progress bar.
+
+    If progbar is provided (e.g., tf.keras.utils.Progbar), updates it each batch up to total_steps.
+    """
+    assert imgsz is not None, "imgsz is required for normalization in fast evaluation"
+    infer = YoloInferencer(model, score_thresh=conf_thres, iou_thresh=iou_thres)
+
+    dets_all: List[np.ndarray] = []
+    gts_all: List[np.ndarray] = []
+    step = 0
+    for batch in val_ds:
+        step += 1
+        if isinstance(batch, (tuple, list)) and len(batch) == 2 and isinstance(batch[0], (tuple, list)):
+            (images, labels), _targets = batch
+            boxes, scores, classes, valid = infer.predict(images)
+            B = images.shape[0]
+            for i in range(B):
+                n = int(valid[i].numpy())
+                bi = boxes[i][:n].numpy() / float(imgsz)
+                si = scores[i][:n].numpy()
+                ci = classes[i][:n].numpy().astype(np.float32)
+                if n > 0:
+                    dets_all.append(np.concatenate([bi, si[:, None], ci[:, None]], axis=1))
+                else:
+                    dets_all.append(np.zeros((0, 6), dtype=np.float32))
+            labs = labels.numpy()
+            for i in range(labs.shape[0]):
+                li = labs[i]
+                mask = (li[:, 3] > 0) & (li[:, 4] > 0)
+                gts_all.append(li[mask])
+        else:
+            images, targets = batch
+            boxes, scores, classes, valid = infer.predict(images)
+            B = images.shape[0]
+            H, W = images.shape[1], images.shape[2]
+            for i in range(B):
+                n = int(valid[i].numpy())
+                bi = boxes[i][:n].numpy() / float(imgsz)
+                si = scores[i][:n].numpy()
+                ci = classes[i][:n].numpy().astype(np.float32)
+                if n > 0:
+                    dets_all.append(np.concatenate([bi, si[:, None], ci[:, None]], axis=1))
+                else:
+                    dets_all.append(np.zeros((0, 6), dtype=np.float32))
+            tt = targets.numpy()
+            for i in range(tt.shape[0]):
+                t = tt[i]
+                mask = t[:, 5] > 0.5
+                t = t[mask]
+                if t.size == 0:
+                    gts_all.append(np.zeros((0, 5), dtype=np.float32))
+                else:
+                    cls = t[:, 0:1]
+                    x1, y1, x2, y2 = t[:, 1:2], t[:, 2:3], t[:, 3:4], t[:, 4:5]
+                    cx = (x1 + x2) / 2.0 / float(W)
+                    cy = (y1 + y2) / 2.0 / float(H)
+                    w = (x2 - x1) / float(W)
+                    h = (y2 - y1) / float(H)
+                    gts_all.append(np.concatenate([cls, cx, cy, w, h], axis=1))
+
+        if progbar is not None and total_steps is not None:
+            progbar.update(min(step, total_steps))
 
     p, r, map50 = compute_pr_map50(dets_all, gts_all, num_classes, iou_thres=0.5)
     map5095 = compute_map50_95(dets_all, gts_all, num_classes)

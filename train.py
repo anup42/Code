@@ -5,7 +5,7 @@ import tensorflow as tf
 from yolo11_tf.model import build_yolo11
 from yolo11_tf.data import build_trainer_dataset
 from yolo11_tf.train_utils import Trainer, TrainConfig
-from yolo11_tf.metrics import evaluate_dataset_pr_maps
+from yolo11_tf.metrics import evaluate_dataset_pr_maps, evaluate_dataset_pr_maps_fast
 
 
 def parse_args():
@@ -58,9 +58,11 @@ def main():
     train_ds, num_classes = build_trainer_dataset(args.data, imgsz=args.imgsz, batch_size=args.batch, split="train", shuffle=True)
     val_ds, _ = build_trainer_dataset(args.data, imgsz=args.imgsz, batch_size=args.batch, split="val", shuffle=False)
     # Steps per epoch for progress bar
-    train_dir, _, _ = load_yolo_yaml(args.data)
+    train_dir, val_dir, _ = load_yolo_yaml(args.data)
     train_files = build_file_list(train_dir)
+    val_files = build_file_list(val_dir)
     steps_per_epoch = max(1, len(train_files) // args.batch)
+    steps_per_val = max(1, len(val_files) // args.batch)
     # Optional cache and non-deterministic order for throughput
     if hasattr(args, 'cache') and getattr(args, 'cache'):
         train_ds = train_ds.cache()
@@ -95,8 +97,13 @@ def main():
                 ])
             if step >= steps_per_epoch:
                 break
-        # Evaluate PR/mAP@0.5 and mAP@0.5:0.95 on val set
-        p, r, m50, m5095 = evaluate_dataset_pr_maps(model, val_ds, num_classes, conf_thres=0.001, imgsz=args.imgsz)
+        # Evaluate PR/mAP with progress bar on validation
+        print("Validating...")
+        pb_val = tf.keras.utils.Progbar(steps_per_val, stateful_metrics=["p","r","mAP50","mAP50-95"], unit_name="val")
+        p, r, m50, m5095 = evaluate_dataset_pr_maps_fast(
+            model, val_ds, num_classes, conf_thres=0.001, iou_thres=0.5, max_det=300, imgsz=args.imgsz,
+            progbar=pb_val, total_steps=steps_per_val,
+        )
         dt = time.time() - t0
         ips = (seen / dt) if dt > 0 else 0.0
         print(

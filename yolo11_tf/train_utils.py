@@ -190,6 +190,9 @@ class Trainer:
                 # For classification: build targets per location (one-hot per GT) squeezed onto unique indices.
                 # Simpler: compute classification loss only at positive gt selections.
                 b_idx, g_idx = tf.where(mask)[:, 0], tf.where(mask)[:, 1]
+                b_idx = tf.cast(b_idx, tf.int32)
+                g_idx = tf.cast(g_idx, tf.int32)
+                lin_idx = tf.zeros([0], dtype=tf.int32)
                 if tf.shape(b_idx)[0] > 0:
                     lin_idx = tf.gather_nd(idx, tf.stack([b_idx, g_idx], axis=1))  # [M]
                     pred_cls_sel = tf.gather(cls_map, b_idx)
