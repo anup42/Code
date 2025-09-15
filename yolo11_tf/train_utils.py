@@ -228,6 +228,24 @@ class Trainer:
                     )
                     total_box += box_loss
 
+                # Background negative classification sampling to teach background separation
+                # Build [B, HW] mask of positive points
+                pos_points = tf.zeros([B, HW], dtype=tf.bool)
+                if tf.shape(b_idx)[0] > 0:
+                    updates = tf.ones([tf.shape(b_idx)[0]], dtype=tf.bool)
+                    pos_points = tf.tensor_scatter_nd_update(pos_points, tf.stack([b_idx, lin_idx], axis=1), updates)
+                neg_mask_points = tf.logical_not(pos_points)
+                # Sample up to K negatives per image by top-k random scores over negatives
+                K = tf.minimum(HW, tf.constant(512, dtype=tf.int32))
+                rnd = tf.random.uniform([B, HW], dtype=tf.float32)
+                scores = tf.where(neg_mask_points, rnd, tf.fill([B, HW], -1.0))
+                _, neg_idx = tf.math.top_k(scores, k=K)
+                pred_neg_cls = tf.gather(cls_map, neg_idx, batch_dims=1)  # [B, K, C]
+                zero_tgt = tf.zeros_like(pred_neg_cls)
+                neg_ce = bce_with_logits_loss(pred_neg_cls, zero_tgt)
+                neg_cls_loss = 0.25 * tf.reduce_mean(neg_ce)
+                total_cls += neg_cls_loss
+
                 # Skip expensive full decode during training; evaluation runs its own decode
 
             # combine losses
