@@ -17,12 +17,13 @@ class YoloInferencer:
         out = self.model(images, training=False)
         cls_list = out["cls"]
         reg_list = out["reg"]
+        obj_list = out.get("obj", [tf.zeros_like(cls_list[0])[..., :1]] * len(cls_list))
         grids = out["grids"]
         strides = out["strides"]
 
         boxes_all = []
         scores_all = []
-        for cls_map, reg_map, pts, stride in zip(cls_list, reg_list, grids, strides):
+        for cls_map, reg_map, obj_map, pts, stride in zip(cls_list, reg_list, obj_list, grids, strides):
             dist = integral_distribution(reg_map, reg_max=16) * float(stride)
             pts_b = tf.tile(pts[None, ...], [tf.shape(images)[0], 1, 1])
             x1 = pts_b[..., 0] - dist[..., 0]
@@ -31,7 +32,7 @@ class YoloInferencer:
             y2 = pts_b[..., 1] + dist[..., 3]
             boxes = tf.stack([x1, y1, x2, y2], axis=-1)
             boxes_all.append(boxes)
-            scores_all.append(tf.sigmoid(cls_map))
+            scores_all.append(tf.sigmoid(cls_map) * tf.sigmoid(obj_map))
 
         boxes = tf.concat(boxes_all, axis=1)  # [B, N, 4]
         scores = tf.concat(scores_all, axis=1)  # [B, N, C]
@@ -40,4 +41,3 @@ class YoloInferencer:
 
     def predict(self, images: tf.Tensor):
         return self._forward(images)
-

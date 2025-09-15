@@ -85,23 +85,30 @@ class DetectHeadDFL(keras.Model):
         self.stems = []
         self.cls_convs = []
         self.reg_convs = []
+        self.obj_convs = []
         self.cls_preds = []
         self.reg_preds = []
+        self.obj_preds = []
         for i, c in enumerate(ch):
             stem = ConvBnSiLU(c, 1, 1, name=f"stem_{i}")
             cls_conv = keras.Sequential([ConvBnSiLU(c, 3, 1), ConvBnSiLU(c, 3, 1)], name=f"cls_conv_{i}")
             reg_conv = keras.Sequential([ConvBnSiLU(c, 3, 1), ConvBnSiLU(c, 3, 1)], name=f"reg_conv_{i}")
             cls_pred = L.Conv2D(num_classes, 1, 1, padding="same", name=f"cls_pred_{i}")
             reg_pred = L.Conv2D(4 * self.bins, 1, 1, padding="same", name=f"reg_pred_{i}")
+            obj_conv = keras.Sequential([ConvBnSiLU(c, 3, 1)], name=f"obj_conv_{i}")
+            obj_pred = L.Conv2D(1, 1, 1, padding="same", name=f"obj_pred_{i}")
             self.stems.append(stem)
             self.cls_convs.append(cls_conv)
             self.reg_convs.append(reg_conv)
+            self.obj_convs.append(obj_conv)
             self.cls_preds.append(cls_pred)
             self.reg_preds.append(reg_pred)
+            self.obj_preds.append(obj_pred)
 
     def call(self, feats, training=False):
         cls_list = []
         reg_list = []
+        obj_list = []
         grids = []
         # Build per-scale outputs
         for i, f in enumerate(feats):
@@ -110,6 +117,8 @@ class DetectHeadDFL(keras.Model):
             reg_feat = self.reg_convs[i](x, training=training)
             cls_out = self.cls_preds[i](cls_feat)  # [B,H,W,C]
             reg_out = self.reg_preds[i](reg_feat)  # [B,H,W,4*bins]
+            obj_feat = self.obj_convs[i](x, training=training)
+            obj_out = self.obj_preds[i](obj_feat)  # [B,H,W,1]
 
             B = tf.shape(cls_out)[0]
             H = tf.shape(cls_out)[1]
@@ -118,6 +127,7 @@ class DetectHeadDFL(keras.Model):
             # Flatten to [B,HW,*]
             cls_list.append(tf.reshape(cls_out, [B, H * W, -1]))
             reg_list.append(tf.reshape(reg_out, [B, H * W, -1]))
+            obj_list.append(tf.reshape(obj_out, [B, H * W, -1]))
 
             # Grid centers in pixels
             stride = float(self.strides[i])
@@ -129,7 +139,7 @@ class DetectHeadDFL(keras.Model):
             grid = tf.stack([gx, gy], axis=-1)  # [H,W,2]
             grids.append(tf.reshape(grid, [H * W, 2]))
 
-        return {"cls": cls_list, "reg": reg_list, "grids": grids, "strides": list(self.strides)}
+        return {"cls": cls_list, "reg": reg_list, "obj": obj_list, "grids": grids, "strides": list(self.strides)}
 
 
 def build_yolo11(num_classes, width_mult=0.50, depth_mult=0.33, reg_max=16):

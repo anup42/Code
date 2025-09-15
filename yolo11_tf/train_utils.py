@@ -158,6 +158,7 @@ class Trainer:
             outputs = self.model(images, training=True)
             cls_outs: List[tf.Tensor] = outputs["cls"]  # 3 tensors [B, HW, C]
             reg_outs: List[tf.Tensor] = outputs["reg"]  # 3 tensors [B, HW, 4*(R)]
+            obj_outs: List[tf.Tensor] = outputs.get("obj", [tf.zeros_like(outputs["cls"][0])[..., :1]] * 3)  # [B,HW,1]
             grids = outputs["grids"]
             strides = outputs["strides"]
 
@@ -167,6 +168,7 @@ class Trainer:
             total_box = 0.0
             total_dfl = 0.0
             total_pos = 0.0
+            total_obj = 0.0
 
             decoded_boxes_all = []
             cls_scores_all = []
@@ -174,6 +176,7 @@ class Trainer:
             for si in range(3):
                 cls_map = cls_outs[si]
                 reg_map = reg_outs[si]
+                obj_map = obj_outs[si]
                 pts = grids[si]
                 stride = float(strides[si])
 
@@ -231,6 +234,13 @@ class Trainer:
                     )
                     total_box += box_loss
 
+                    # Objectness on positives
+                    pred_obj_pos = tf.gather(obj_map, b_idx)
+                    pred_obj_pos = tf.gather(pred_obj_pos, lin_idx, batch_dims=1)  # [M,1]
+                    obj_pos_tgt = tf.ones_like(pred_obj_pos)
+                    obj_pos_loss = tf.reduce_mean(bce_with_logits_loss(pred_obj_pos, obj_pos_tgt))
+                    total_obj += obj_pos_loss
+
                 # Background negative classification sampling to teach background separation
                 # Build [B, HW] mask of positive points
                 pos_points = tf.zeros([B, HW], dtype=tf.bool)
@@ -249,6 +259,12 @@ class Trainer:
                 neg_cls_loss = 0.25 * tf.reduce_mean(neg_ce)
                 total_cls += neg_cls_loss
 
+                # Objectness negatives
+                pred_neg_obj = tf.gather(obj_map, neg_idx, batch_dims=1)  # [B,K,1]
+                zero_obj = tf.zeros_like(pred_neg_obj)
+                neg_obj_loss = 0.25 * tf.reduce_mean(bce_with_logits_loss(pred_neg_obj, zero_obj))
+                total_obj += neg_obj_loss
+
                 # Skip expensive full decode during training; evaluation runs its own decode
 
             # combine losses
@@ -256,6 +272,7 @@ class Trainer:
                 self.cfg.cls_loss_gain * total_cls
                 + self.cfg.box_loss_gain * total_box
                 + self.cfg.dfl_loss_gain * total_dfl
+                + 1.0 * total_obj
             )
 
         grads = tape.gradient(loss, self.model.trainable_variables)
@@ -267,6 +284,7 @@ class Trainer:
             "box": tf.cast(total_box, tf.float32),
             "dfl": tf.cast(total_dfl, tf.float32),
             "pos": tf.cast(total_pos, tf.float32),
+            "obj": tf.cast(total_obj, tf.float32),
         }
 
 

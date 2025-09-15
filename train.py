@@ -84,7 +84,7 @@ def main():
         print(f"Epoch {epoch+1}/{args.epochs}")
         t0 = time.time()
         seen = 0
-        pb = tf.keras.utils.Progbar(steps_per_epoch, stateful_metrics=["loss","cls","box","dfl","pos"], unit_name="batch")
+        pb = tf.keras.utils.Progbar(steps_per_epoch, stateful_metrics=["loss","cls","box","dfl","obj","pos"], unit_name="batch")
         for step, (images, targets) in enumerate(train_ds, start=1):
             try:
                 seen += int(images.shape[0])
@@ -93,7 +93,7 @@ def main():
             metrics = trainer.train_step(images, targets)
             if step <= steps_per_epoch:
                 pb.update(step, values=[
-                    ("loss", metrics['loss']), ("cls", metrics['cls']), ("box", metrics['box']), ("dfl", metrics['dfl']), ("pos", metrics['pos'])
+                    ("loss", metrics['loss']), ("cls", metrics['cls']), ("box", metrics['box']), ("dfl", metrics['dfl']), ("obj", metrics.get('obj', 0.0)), ("pos", metrics['pos'])
                 ])
             if step >= steps_per_epoch:
                 break
