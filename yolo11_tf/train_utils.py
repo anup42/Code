@@ -6,6 +6,12 @@ import tensorflow as tf
 
 from .losses import bce_with_logits_loss, dfl_loss, bbox_ciou, integral_distribution
 
+# Disable global XLA JIT if enabled by environment to avoid GPU UnsortedSegment crashes
+try:
+    tf.config.optimizer.set_jit(False)
+except Exception:
+    pass
+
 
 @dataclass
 class TrainConfig:
@@ -27,6 +33,16 @@ class Trainer:
         self.model = model
         self.cfg = cfg
         self.optimizer = tf.keras.optimizers.Adam(learning_rate=cfg.lr)
+
+    @staticmethod
+    def _gather_cpu(x, indices, batch_dims=0):
+        with tf.device('/CPU:0'):
+            return tf.gather(x, indices, batch_dims=batch_dims)
+
+    @staticmethod
+    def _gather_nd_cpu(x, indices):
+        with tf.device('/CPU:0'):
+            return tf.gather_nd(x, indices)
 
     @staticmethod
     def _build_grids_from_outputs(outputs: Dict):
@@ -198,16 +214,16 @@ class Trainer:
                 lin_idx = tf.zeros([0], dtype=tf.int32)
                 if tf.shape(b_idx)[0] > 0:
                     lin_idx = tf.gather_nd(idx, tf.stack([b_idx, g_idx], axis=1))  # [M]
-                    pred_cls_sel = tf.gather(cls_map, b_idx)
-                    pred_cls_sel = tf.gather(pred_cls_sel, lin_idx, batch_dims=1)  # [M, C]
+                    pred_cls_sel = self._gather_cpu(cls_map, b_idx)
+                    pred_cls_sel = self._gather_cpu(pred_cls_sel, lin_idx, batch_dims=1)  # [M, C]
 
-                    tgt_cls = tf.gather_nd(pos_targs[si]["cls"], tf.stack([b_idx, g_idx], axis=1))  # [M, C]
+                    tgt_cls = self._gather_nd_cpu(pos_targs[si]["cls"], tf.stack([b_idx, g_idx], axis=1))  # [M, C]
                     cls_loss = tf.reduce_sum(bce_with_logits_loss(pred_cls_sel, tgt_cls)) / num_pos
                     total_cls += cls_loss
 
                     # Regression and DFL on positives
-                    pred_reg_sel = tf.gather(reg_map, b_idx)
-                    pred_reg_sel = tf.gather(pred_reg_sel, lin_idx, batch_dims=1)  # [M, 4*(R)]
+                    pred_reg_sel = self._gather_cpu(reg_map, b_idx)
+                    pred_reg_sel = self._gather_cpu(pred_reg_sel, lin_idx, batch_dims=1)  # [M, 4*(R)]
                     bins = self.cfg.reg_max + 1
                     pred_reg_sel = tf.reshape(pred_reg_sel, [-1, 4, bins])
                     tgt_ltrb = tf.gather_nd(pos_targs[si]["ltrb"], tf.stack([b_idx, g_idx], axis=1))  # [M, 4]
@@ -216,7 +232,7 @@ class Trainer:
 
                     # decode boxes for IoU loss
                     # compute point coords for selected indices
-                    pts_sel = tf.gather(pts, lin_idx)  # [M, 2]
+                    pts_sel = tf.gather(pts, lin_idx)  # [M, 2] (no gradient to model outputs)
                     # distances in strides
                     dist = tgt_ltrb * stride
                     x1 = pts_sel[:, 0] - dist[:, 0]
@@ -235,8 +251,8 @@ class Trainer:
                     total_box += box_loss
 
                     # Objectness on positives
-                    pred_obj_pos = tf.gather(obj_map, b_idx)
-                    pred_obj_pos = tf.gather(pred_obj_pos, lin_idx, batch_dims=1)  # [M,1]
+                    pred_obj_pos = self._gather_cpu(obj_map, b_idx)
+                    pred_obj_pos = self._gather_cpu(pred_obj_pos, lin_idx, batch_dims=1)  # [M,1]
                     obj_pos_tgt = tf.ones_like(pred_obj_pos)
                     obj_pos_loss = tf.reduce_mean(bce_with_logits_loss(pred_obj_pos, obj_pos_tgt))
                     total_obj += obj_pos_loss
@@ -284,11 +300,11 @@ class Trainer:
                     cls_oh_pos = tf.one_hot(cls_ids_pos, depth=C)
                     # Predicted boxes for selected points (DFL decode)
                     bins = self.cfg.reg_max + 1
-                    pred_reg_pts = tf.gather(reg_map, b_pos)
-                    pred_reg_pts = tf.gather(pred_reg_pts, n_pos, batch_dims=1)  # [M, 4*(R)]
+                    pred_reg_pts = self._gather_cpu(reg_map, b_pos)
+                    pred_reg_pts = self._gather_cpu(pred_reg_pts, n_pos, batch_dims=1)  # [M, 4*(R)]
                     pred_reg_pts = tf.reshape(pred_reg_pts, [-1, 4, bins])
                     dist_bins = integral_distribution(pred_reg_pts, self.cfg.reg_max) * stride  # [M,4]
-                    pxy = tf.gather(pts, n_pos)  # [M,2]
+                    pxy = tf.gather(pts, n_pos)  # [M,2] (no gradient to model outputs)
                     px1 = pxy[:, 0] - dist_bins[:, 0]
                     py1 = pxy[:, 1] - dist_bins[:, 1]
                     px2 = pxy[:, 0] + dist_bins[:, 2]
@@ -318,11 +334,11 @@ class Trainer:
                     i_sel = top_idx
                     w = top_vals  # [Kp]
                     # Gather predictions for selected points
-                    pred_cls_pts = tf.gather(tf.gather(cls_map, b_pos), i_sel, batch_dims=0)
-                    pred_cls_pts = tf.gather(pred_cls_pts, tf.gather(n_pos, i_sel), batch_dims=1)
+                    pred_cls_pts = self._gather_cpu(self._gather_cpu(cls_map, b_pos), i_sel, batch_dims=0)
+                    pred_cls_pts = self._gather_cpu(pred_cls_pts, tf.gather(n_pos, i_sel), batch_dims=1)
                     cls_oh_sel = tf.gather(cls_oh_pos, i_sel)
-                    pred_obj_pts = tf.gather(tf.gather(obj_map, b_pos), i_sel, batch_dims=0)
-                    pred_obj_pts = tf.gather(pred_obj_pts, tf.gather(n_pos, i_sel), batch_dims=1)
+                    pred_obj_pts = self._gather_cpu(self._gather_cpu(obj_map, b_pos), i_sel, batch_dims=0)
+                    pred_obj_pts = self._gather_cpu(pred_obj_pts, tf.gather(n_pos, i_sel), batch_dims=1)
                     # Weighted classification/objectness losses
                     cls_loss_pts = bce_with_logits_loss(pred_cls_pts, cls_oh_sel)
                     cls_loss_pts = tf.reduce_sum(cls_loss_pts * w[:, None]) / (tf.reduce_sum(w) + 1e-9)
@@ -349,14 +365,14 @@ class Trainer:
                 rnd = tf.random.uniform([B, HW], dtype=tf.float32)
                 scores = tf.where(neg_mask_points, rnd, tf.fill([B, HW], -1.0))
                 _, neg_idx = tf.math.top_k(scores, k=K)
-                pred_neg_cls = tf.gather(cls_map, neg_idx, batch_dims=1)  # [B, K, C]
+                pred_neg_cls = self._gather_cpu(cls_map, neg_idx, batch_dims=1)  # [B, K, C]
                 zero_tgt = tf.zeros_like(pred_neg_cls)
                 neg_ce = bce_with_logits_loss(pred_neg_cls, zero_tgt)
                 neg_cls_loss = 0.25 * tf.reduce_mean(neg_ce)
                 total_cls += neg_cls_loss
 
                 # Objectness negatives
-                pred_neg_obj = tf.gather(obj_map, neg_idx, batch_dims=1)  # [B,K,1]
+                pred_neg_obj = self._gather_cpu(obj_map, neg_idx, batch_dims=1)  # [B,K,1]
                 zero_obj = tf.zeros_like(pred_neg_obj)
                 neg_obj_loss = 0.25 * tf.reduce_mean(bce_with_logits_loss(pred_neg_obj, zero_obj))
                 total_obj += neg_obj_loss
