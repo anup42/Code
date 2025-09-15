@@ -40,22 +40,19 @@ class Trainer:
 
     @staticmethod
     def _assert_indices_in_range(idx: tf.Tensor, upper: tf.Tensor, name: str = "idx"):
-        """Assert that all indices are in [0, upper). No-op outside tf.function eager errors.
-        Returns idx with control dependencies so downstream ops run after checks.
+        """Assert idx in [0, upper). Returns identity of idx with control deps.
+        Uses max/min on augmented tensors to avoid shape-dependent control flow.
         """
         idx = tf.convert_to_tensor(idx)
-        upper = tf.convert_to_tensor(upper)
-        checks = []
-        # Only check if there are any elements
-        numel = tf.size(idx)
-        def add_checks():
-            checks_local = [
-                tf.debugging.assert_non_negative(idx, message=f"{name} has negative values"),
-                tf.debugging.assert_less(idx, upper, message=f"{name} contains values >= upper bound"),
-            ]
-            return checks_local
-        checks = tf.cond(numel > 0, lambda: add_checks(), lambda: [])
-        with tf.control_dependencies(checks if isinstance(checks, (list, tuple)) else [checks]):
+        upper = tf.cast(upper, idx.dtype)
+        flat = tf.reshape(idx, [-1])
+        # If idx is empty, safe_min=0, safe_max=-1
+        safe_min = tf.reduce_min(tf.concat([flat, tf.zeros([1], dtype=idx.dtype)], axis=0))
+        safe_max = tf.reduce_max(tf.concat([flat, tf.constant([-1], dtype=idx.dtype)], axis=0))
+        with tf.control_dependencies([
+            tf.debugging.assert_greater_equal(safe_min, tf.cast(0, idx.dtype), message=f"{name} has negative values"),
+            tf.debugging.assert_less(safe_max, upper, message=f"{name} contains values >= upper bound"),
+        ]):
             return tf.identity(idx)
 
     @staticmethod
@@ -309,7 +306,7 @@ class Trainer:
                 any_ok = tf.reduce_any(allow, axis=1)  # [B,N]
                 gt_choice = tf.argmin(d_masked, axis=1, output_type=tf.int32)  # [B,N]
                 pos_pairs = tf.where(any_ok)  # [M,2] (b, n)
-                if tf.shape(pos_pairs)[0] > 0:
+                def _cr_additions():
                     b_pos = tf.cast(pos_pairs[:, 0], tf.int32)
                     n_pos = tf.cast(pos_pairs[:, 1], tf.int32)
                     g_pos = tf.gather_nd(gt_choice, pos_pairs)  # [M]
@@ -319,7 +316,6 @@ class Trainer:
                     cls_oh_pos = tf.one_hot(cls_ids_pos, depth=C)
                     # Predicted boxes for selected points (DFL decode)
                     bins = self.cfg.reg_max + 1
-                    # Validate point indices for head map
                     n_pos = self._assert_indices_in_range(n_pos, HW, name="n_pos")
                     pred_reg_pts = self._gather_cpu(reg_map, b_pos)
                     pred_reg_pts = self._gather_cpu(pred_reg_pts, n_pos, batch_dims=1)  # [M, 4*(R)]
@@ -349,19 +345,18 @@ class Trainer:
                     area_g = tf.maximum(0.0, (gbox[:, 2] - gbox[:, 0])) * tf.maximum(0.0, (gbox[:, 3] - gbox[:, 1]))
                     union = area_p + area_g - inter + 1e-9
                     iou_w = inter / union  # [M]
-                    # Optional: keep top-K points by IoU to limit compute
-                    # Run top-k on CPU to avoid GPU scatter/segment kernels in gradients
+                    # Keep top-K by IoU (CPU)
                     with tf.device('/CPU:0'):
                         M = tf.shape(iou_w)[0]
                         Kp = tf.minimum(M, tf.constant(4096, dtype=tf.int32))
                         def _do_topk():
-                            return tf.math.top_k(iou_w, k=Kp)
+                            res = tf.math.top_k(iou_w, k=Kp)
+                            return res.values, res.indices
                         def _empty():
                             return tf.zeros([0], dtype=iou_w.dtype), tf.zeros([0], dtype=tf.int32)
                         top_vals, top_idx = tf.cond(M > 0, _do_topk, _empty)
                     i_sel = top_idx
-                    w = top_vals  # [Kp]
-                    # Gather predictions for selected points
+                    w = top_vals
                     pred_cls_pts = self._gather_cpu(self._gather_cpu(cls_map, b_pos), i_sel, batch_dims=0)
                     n_pos_sel = tf.gather(n_pos, i_sel)
                     n_pos_sel = self._assert_indices_in_range(n_pos_sel, HW, name="n_pos_sel")
@@ -369,12 +364,16 @@ class Trainer:
                     cls_oh_sel = tf.gather(cls_oh_pos, i_sel)
                     pred_obj_pts = self._gather_cpu(self._gather_cpu(obj_map, b_pos), i_sel, batch_dims=0)
                     pred_obj_pts = self._gather_cpu(pred_obj_pts, n_pos_sel, batch_dims=1)
-                    # Weighted classification/objectness losses
                     cls_loss_pts = bce_with_logits_loss(pred_cls_pts, cls_oh_sel)
-                    cls_loss_pts = tf.reduce_sum(cls_loss_pts * w[:, None]) / (tf.reduce_sum(w) + 1e-9)
-                    total_cls += cls_loss_pts
-                    obj_pos_loss2 = tf.reduce_sum(bce_with_logits_loss(pred_obj_pts, tf.ones_like(pred_obj_pts)) * w[:, None]) / (tf.reduce_sum(w) + 1e-9)
-                    total_obj += obj_pos_loss2
+                    cls_loss_pts = tf.reduce_sum(cls_loss_pts * tf.where(tf.size(w) > 0, w[:, None], tf.zeros_like(cls_loss_pts))) / (tf.reduce_sum(w) + 1e-9)
+                    obj_pos_loss2 = tf.reduce_sum(bce_with_logits_loss(pred_obj_pts, tf.ones_like(pred_obj_pts)) * tf.where(tf.size(w) > 0, w[:, None], tf.zeros_like(pred_obj_pts))) / (tf.reduce_sum(w) + 1e-9)
+                    return cls_loss_pts, obj_pos_loss2
+                def _no_cr():
+                    z = tf.constant(0.0, tf.float32)
+                    return z, z
+                add_cls, add_obj = tf.cond(tf.shape(pos_pairs)[0] > 0, _cr_additions, _no_cr)
+                total_cls += add_cls
+                total_obj += add_obj
 
                 # Background negative classification sampling to teach background separation
                 # Build [B, HW] mask of positive points.
