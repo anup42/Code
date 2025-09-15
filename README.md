@@ -27,8 +27,8 @@ Install
   - GPU: install a matching TensorFlow build per your CUDA/CUDNN.
 
 Train
-- Example (COCO-like 80 classes):
-  - `python train.py --data C:/path/to/dataset --classes 80 --epochs 100 --imgsz 640 --batch 8`
+- Example (YOLO-style YAML):
+  - `python train.py --data C:/path/to/data.yaml --imgsz 640 --batch 8 --epochs 100 --model_scale s`
 - Weights are saved to `runs/train/exp/` as `weights_epoch*.h5` and `best.h5`.
 
 COCO2017
