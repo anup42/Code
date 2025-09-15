@@ -45,7 +45,7 @@ def _nms_np(boxes: np.ndarray, scores: np.ndarray, iou_thres: float, max_det: in
     return np.array(keep, dtype=np.int32)
 
 
-def decode_maps_to_dets_np(pred, conf_thres=0.25, iou_thres=0.5, max_det=300) -> List[np.ndarray]:
+def decode_maps_to_dets_np(pred, conf_thres=0.25, iou_thres=0.5, max_det=300, imgsz: int | None = None) -> List[np.ndarray]:
     """Decode predictions to detections.
 
     Supports two formats:
@@ -73,10 +73,15 @@ def decode_maps_to_dets_np(pred, conf_thres=0.25, iou_thres=0.5, max_det=300) ->
         reg_reshaped = reg_all.reshape([B, -1, 4, bins])
         dist = integral_distribution(tf.convert_to_tensor(reg_reshaped), bins - 1).numpy()  # [B,N,4]
         dist_pix = dist * stride_vec[None, :, None]  # [B,N,4]
-        # Convert to xyxy in pixels then normalize by inferred image size from grid range
-        min_stride = float(min(strides)) if hasattr(strides, '__iter__') else float(strides)
-        img_w = float((grid_all[:, 0].max() - grid_all[:, 0].min()) + min_stride)
-        img_h = float((grid_all[:, 1].max() - grid_all[:, 1].min()) + min_stride)
+        # Convert to xyxy in pixels then normalize by image size
+        if imgsz is not None:
+            img_w = float(imgsz)
+            img_h = float(imgsz)
+        else:
+            # Fallback: infer from grid range
+            min_stride = float(min(strides)) if hasattr(strides, '__iter__') else float(strides)
+            img_w = float((grid_all[:, 0].max() - grid_all[:, 0].min()) + min_stride)
+            img_h = float((grid_all[:, 1].max() - grid_all[:, 1].min()) + min_stride)
         for b in range(B):
             pts = grid_all  # [N,2]
             d = dist_pix[b]
@@ -311,7 +316,7 @@ def compute_map50_95(dets_by_img: List[np.ndarray], gts_by_img: List[np.ndarray]
 
 
 def evaluate_dataset_pr_maps(model: tf.keras.Model, val_ds, num_classes: int,
-                             conf_thres=0.25, iou_thres=0.5, max_det=300):
+                             conf_thres=0.25, iou_thres=0.5, max_det=300, imgsz: int | None = None):
     """Compute precision, recall, mAP@0.5, and mAP@0.5:0.95."""
     dets_all: List[np.ndarray] = []
     gts_all: List[np.ndarray] = []
@@ -319,7 +324,7 @@ def evaluate_dataset_pr_maps(model: tf.keras.Model, val_ds, num_classes: int,
         if isinstance(batch, (tuple, list)) and len(batch) == 2 and isinstance(batch[0], (tuple, list)):
             (images, labels), _targets = batch
             preds = model(images, training=False)
-            dets = decode_maps_to_dets_np(preds, conf_thres=conf_thres, iou_thres=iou_thres, max_det=max_det)
+            dets = decode_maps_to_dets_np(preds, conf_thres=conf_thres, iou_thres=iou_thres, max_det=max_det, imgsz=imgsz)
             labs = labels.numpy()
             for i in range(labs.shape[0]):
                 li = labs[i]
@@ -329,7 +334,7 @@ def evaluate_dataset_pr_maps(model: tf.keras.Model, val_ds, num_classes: int,
         else:
             images, targets = batch
             preds = model(images, training=False)
-            dets = decode_maps_to_dets_np(preds, conf_thres=conf_thres, iou_thres=iou_thres, max_det=max_det)
+            dets = decode_maps_to_dets_np(preds, conf_thres=conf_thres, iou_thres=iou_thres, max_det=max_det, imgsz=imgsz)
             imgs = images.numpy()
             H, W = imgs.shape[1], imgs.shape[2]
             tt = targets.numpy()
@@ -356,7 +361,7 @@ def evaluate_dataset_pr_maps(model: tf.keras.Model, val_ds, num_classes: int,
 
 
 def evaluate_dataset_map50(model: tf.keras.Model, val_ds, num_classes: int,
-                           conf_thres=0.25, iou_thres=0.5, max_det=300):
+                           conf_thres=0.25, iou_thres=0.5, max_det=300, imgsz: int | None = None):
     dets_all: List[np.ndarray] = []
     gts_all: List[np.ndarray] = []
     for batch in val_ds:
@@ -364,7 +369,7 @@ def evaluate_dataset_map50(model: tf.keras.Model, val_ds, num_classes: int,
         if isinstance(batch, (tuple, list)) and len(batch) == 2 and isinstance(batch[0], (tuple, list)):
             (images, labels), _targets = batch
             preds = model(images, training=False)
-            dets = decode_maps_to_dets_np(preds, conf_thres=conf_thres, iou_thres=iou_thres, max_det=max_det)
+            dets = decode_maps_to_dets_np(preds, conf_thres=conf_thres, iou_thres=iou_thres, max_det=max_det, imgsz=imgsz)
             labs = labels.numpy()
             for i in range(labs.shape[0]):
                 li = labs[i]
@@ -374,7 +379,7 @@ def evaluate_dataset_map50(model: tf.keras.Model, val_ds, num_classes: int,
         else:
             images, targets = batch
             preds = model(images, training=False)
-            dets = decode_maps_to_dets_np(preds, conf_thres=conf_thres, iou_thres=iou_thres, max_det=max_det)
+            dets = decode_maps_to_dets_np(preds, conf_thres=conf_thres, iou_thres=iou_thres, max_det=max_det, imgsz=imgsz)
             imgs = images.numpy()
             H, W = imgs.shape[1], imgs.shape[2]
             tt = targets.numpy()  # [B, max_labels, 6]

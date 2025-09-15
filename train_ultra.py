@@ -82,7 +82,7 @@ def main():
                     flush=True,
                 )
         # Eval quick metrics at epoch end (mAP@0.5 on val)
-        p, r, m = evaluate_dataset_map50(model, val_ds.map(lambda img, tgt: ((img, tf.zeros([tf.shape(tgt)[0], cfg.max_boxes, 5], dtype=tf.float32)), tgt)), num_classes, conf_thres=0.05, iou_thres=0.5)
+        p, r, m = evaluate_dataset_map50(model, val_ds.map(lambda img, tgt: ((img, tf.zeros([tf.shape(tgt)[0], cfg.max_boxes, 5], dtype=tf.float32)), tgt)), num_classes, conf_thres=0.05, iou_thres=0.5, imgsz=args.imgsz)
         dt = time.time() - t0
         ips = (seen / dt) if dt > 0 else 0.0
         print(

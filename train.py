@@ -82,7 +82,7 @@ def main():
                     flush=True,
                 )
         # Evaluate PR/mAP@0.5 and mAP@0.5:0.95 on val set
-        p, r, m50, m5095 = evaluate_dataset_pr_maps(model, val_ds, num_classes, conf_thres=0.05)
+        p, r, m50, m5095 = evaluate_dataset_pr_maps(model, val_ds, num_classes, conf_thres=0.05, imgsz=args.imgsz)
         dt = time.time() - t0
         ips = (seen / dt) if dt > 0 else 0.0
         print(

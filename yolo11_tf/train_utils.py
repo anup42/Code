@@ -44,8 +44,11 @@ class Trainer:
         B = tf.shape(targets)[0]
         maxb = tf.shape(targets)[1]
         C = self.cfg.num_classes
-        # size thresholds (on sqrt(area))
-        s_thresh = tf.constant([64.0, 160.0], dtype=tf.float32)  # for strides 8,16,32
+        # size thresholds (on sqrt(area)) with widened ranges for multi-scale assignment
+        s_small = 64.0
+        s_large = 160.0
+        low_margin = 0.75
+        high_margin = 1.25
 
         pos_idx_list = []
         pos_targ_list = []
@@ -66,13 +69,13 @@ class Trainer:
             h = tf.squeeze(y2 - y1, -1)
             size = tf.sqrt(tf.maximum(w * h, 0.0))
 
-            # choose scale mask
+            # choose scale mask (widened boundaries, allow overlap between adjacent scales)
             if si == 0:
-                scale_mask = size < s_thresh[0]
+                scale_mask = size < (s_small * high_margin)
             elif si == 1:
-                scale_mask = tf.logical_and(size >= s_thresh[0], size < s_thresh[1])
+                scale_mask = tf.logical_and(size >= (s_small * low_margin), size < (s_large * high_margin))
             else:
-                scale_mask = size >= s_thresh[1]
+                scale_mask = size >= (s_large * low_margin)
             scale_mask = tf.logical_and(scale_mask, tf.squeeze(v > 0.5, -1))
 
             # centers
