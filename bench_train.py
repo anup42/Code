@@ -43,7 +43,7 @@ def main():
     loss_fn = YoloLoss(num_classes=num_classes)
     optimizer = tf.keras.optimizers.Adam(learning_rate=args.lr)
 
-    @tf.function(jit_compile=False)
+    @tf.function()
     def train_step(images, targets):
         with tf.GradientTape() as tape:
             preds = model(images, training=True)
@@ -52,7 +52,7 @@ def main():
         optimizer.apply_gradients(zip(grads, model.trainable_variables))
         return loss
 
-    @tf.function(jit_compile=False)
+    @tf.function()
     def infer_step(images):
         _ = model(images, training=False)
 
@@ -88,4 +88,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

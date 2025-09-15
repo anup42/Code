@@ -12,7 +12,7 @@ class YoloInferencer:
         self.score_thresh = score_thresh
         self.iou_thresh = iou_thresh
 
-    @tf.function(jit_compile=False)
+    @tf.function()
     def _forward(self, images: tf.Tensor):
         out = self.model(images, training=False)
         cls_list = out["cls"]

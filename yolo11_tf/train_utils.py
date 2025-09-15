@@ -6,12 +6,6 @@ import tensorflow as tf
 
 from .losses import bce_with_logits_loss, dfl_loss, bbox_ciou, integral_distribution
 
-# Disable global XLA JIT if enabled by environment to avoid GPU UnsortedSegment crashes
-try:
-    tf.config.optimizer.set_jit(False)
-except Exception:
-    pass
-
 
 @dataclass
 class TrainConfig:
@@ -166,9 +160,7 @@ class Trainer:
 
         return pos_idx_list, pos_targ_list
 
-    # Disable XLA JIT here to avoid rare GPU crashes in UnsortedSegment kernels
-    # triggered by complex gather/scatter patterns when compiled.
-    @tf.function(jit_compile=False, experimental_relax_shapes=True)
+    @tf.function(experimental_relax_shapes=True)
     def train_step(self, images, targets):
         with tf.GradientTape() as tape:
             outputs = self.model(images, training=True)
@@ -213,7 +205,7 @@ class Trainer:
                 g_idx = tf.cast(g_idx, tf.int32)
                 lin_idx = tf.zeros([0], dtype=tf.int32)
                 if tf.shape(b_idx)[0] > 0:
-                    # Compute linear indices on CPU to avoid XLA/GPU segment kernels in gradients
+                    # Compute linear indices on CPU for stability
                     with tf.device('/CPU:0'):
                         lin_idx = tf.gather_nd(idx, tf.stack([b_idx, g_idx], axis=1))  # [M]
                     pred_cls_sel = self._gather_cpu(cls_map, b_idx)
