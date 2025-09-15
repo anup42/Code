@@ -113,6 +113,14 @@ def preprocess_example(img_path, cfg: DatasetConfig):
     else:
         labels_adj = tf.zeros((0, 5), dtype=tf.float32)
 
+    # Pad/clip labels to fixed length per image for batching
+    max_labels = cfg.max_labels
+    n = tf.shape(labels_adj)[0]
+    k = tf.minimum(n, max_labels)
+    labels_adj = labels_adj[:k]
+    pad_rows = tf.maximum(0, max_labels - k)
+    labels_adj = tf.pad(labels_adj, [[0, pad_rows], [0, 0]])
+
     # Normalize image 0-1
     lb_img = lb_img / 255.0
     return lb_img, labels_adj
@@ -170,10 +178,11 @@ def make_example_with_targets(img_path: bytes, cfg: DatasetConfig):
     t0.set_shape((cfg.imgsz // cfg.strides[0], cfg.imgsz // cfg.strides[0], 5 + cfg.num_classes))
     t1.set_shape((cfg.imgsz // cfg.strides[1], cfg.imgsz // cfg.strides[1], 5 + cfg.num_classes))
     t2.set_shape((cfg.imgsz // cfg.strides[2], cfg.imgsz // cfg.strides[2], 5 + cfg.num_classes))
-    return img, (t0, t1, t2)
+    # Also return normalized labels [N,5] with columns [cls, cx, cy, w, h]
+    return img, (t0, t1, t2), labels
 
 
-def build_dataset(data_yaml: str, imgsz=640, batch_size=16, split="train", shuffle=True, num_parallel_calls=tf.data.AUTOTUNE):
+def build_dataset(data_yaml: str, imgsz=640, batch_size=16, split="train", shuffle=True, num_parallel_calls=tf.data.AUTOTUNE, include_labels=True):
     train, val, num_classes = load_yolo_yaml(data_yaml)
     src = train if split == "train" else val
     files = build_file_list(src)
@@ -183,6 +192,47 @@ def build_dataset(data_yaml: str, imgsz=640, batch_size=16, split="train", shuff
     if shuffle:
         ds = ds.shuffle(buffer_size=min(10000, len(files)))
     ds = ds.map(lambda p: make_example_with_targets(p, cfg), num_parallel_calls=num_parallel_calls)
+    # Repack to include labels for metrics while keeping targets as y
+    def _pack(img, tlist, labels):
+        if include_labels:
+            return (img, labels), tlist
+        else:
+            return img, tlist
+    ds = ds.map(_pack, num_parallel_calls=num_parallel_calls)
+    ds = ds.batch(batch_size, drop_remainder=True)
+    ds = ds.prefetch(tf.data.AUTOTUNE)
+    return ds, num_classes
+
+
+def build_trainer_dataset(data_yaml: str, imgsz=640, batch_size=16, split="train", shuffle=True, num_parallel_calls=tf.data.AUTOTUNE):
+    """Dataset for Trainer pipeline: returns (images, targets) where
+    targets is [max_labels, 6] with [cls, x1, y1, x2, y2, valid] in pixel coords.
+    """
+    train, val, num_classes = load_yolo_yaml(data_yaml)
+    src = train if split == "train" else val
+    files = build_file_list(src)
+    cfg = DatasetConfig(imgsz=imgsz, batch_size=batch_size, num_classes=num_classes)
+
+    def _make(img_path: bytes):
+        img, labels = preprocess_example(img_path, cfg)
+        # labels: [max_labels,5] [cls,cx,cy,w,h] normalized
+        cls = labels[:, 0:1]
+        cx = labels[:, 1:2]
+        cy = labels[:, 2:3]
+        w = labels[:, 3:4]
+        h = labels[:, 4:5]
+        x1 = (cx - 0.5 * w) * float(cfg.imgsz)
+        y1 = (cy - 0.5 * h) * float(cfg.imgsz)
+        x2 = (cx + 0.5 * w) * float(cfg.imgsz)
+        y2 = (cy + 0.5 * h) * float(cfg.imgsz)
+        valid = tf.cast((w > 0) & (h > 0), tf.float32)
+        t = tf.concat([cls, x1, y1, x2, y2, valid], axis=-1)  # [max_labels,6]
+        return img, t
+
+    ds = tf.data.Dataset.from_tensor_slices(files)
+    if shuffle:
+        ds = ds.shuffle(buffer_size=min(10000, len(files)))
+    ds = ds.map(lambda p: _make(p), num_parallel_calls=num_parallel_calls)
     ds = ds.batch(batch_size, drop_remainder=True)
     ds = ds.prefetch(tf.data.AUTOTUNE)
     return ds, num_classes

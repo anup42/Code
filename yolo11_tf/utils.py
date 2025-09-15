@@ -89,3 +89,23 @@ def nms(boxes, scores, iou_threshold=0.5, max_detections=300):
     )
     return selected
 
+
+def combined_nms(boxes, scores, score_thresh=0.25, iou_thresh=0.45, max_det=300):
+    """TF combined NMS wrapper.
+
+    boxes: [B, N, 4]
+    scores: [B, N, C]
+    Returns: (nmsed_boxes, nmsed_scores, nmsed_classes, valid_detections)
+    """
+    boxes = tf.expand_dims(boxes, axis=2)  # [B,N,1,4]
+    nmsed = tf.image.combined_non_max_suppression(
+        boxes=boxes,
+        scores=scores,
+        max_output_size_per_class=max_det,
+        max_total_size=max_det,
+        iou_threshold=iou_thresh,
+        score_threshold=score_thresh,
+        pad_per_class=False,
+        clip_boxes=False,
+    )
+    return nmsed
