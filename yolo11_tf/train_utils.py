@@ -137,22 +137,22 @@ class Trainer:
                 dists = tf.clip_by_value(dists, 0.0, float(self.cfg.reg_max))
 
                 # write into tensors
+                # Some GPU builds crash in UnsortedSegmentFunctor via TensorScatterUpdate.
+                # Perform these updates on CPU; these are target tensors (no gradients needed).
                 cls_oh = tf.one_hot(tf.gather_nd(cls_ids, b_idx), depth=self.cfg.num_classes)
-
-                cls_t = tf.tensor_scatter_nd_update(
-                    cls_t,
-                    b_idx,
-                    cls_oh,
-                )
-                ltrb_t = tf.tensor_scatter_nd_update(ltrb_t, b_idx, dists)
-                box_t = tf.tensor_scatter_nd_update(box_t, b_idx, boxes)
+                with tf.device('/CPU:0'):
+                    cls_t = tf.tensor_scatter_nd_update(cls_t, b_idx, cls_oh)
+                    ltrb_t = tf.tensor_scatter_nd_update(ltrb_t, b_idx, dists)
+                    box_t = tf.tensor_scatter_nd_update(box_t, b_idx, boxes)
 
             pos_idx_list.append(pos_idx)
             pos_targ_list.append({"cls": cls_t, "ltrb": ltrb_t, "boxes": box_t})
 
         return pos_idx_list, pos_targ_list
 
-    @tf.function(experimental_relax_shapes=True)
+    # Disable XLA JIT here to avoid rare GPU crashes in UnsortedSegment kernels
+    # triggered by complex gather/scatter patterns when compiled.
+    @tf.function(jit_compile=False, experimental_relax_shapes=True)
     def train_step(self, images, targets):
         with tf.GradientTape() as tape:
             outputs = self.model(images, training=True)
