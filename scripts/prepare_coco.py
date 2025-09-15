@@ -172,16 +172,16 @@ def prepare_coco(out_dir: Path):
     images_dir.mkdir(parents=True, exist_ok=True)
     if not (images_dir / "train2017").exists():
         print("Extracting train2017 images...")
-        safe_extract_zip(train_zip, out_dir)
-        # zip extracts to train2017/ at root; move into images/
-        (out_dir / "train2017").rename(images_dir / "train2017")
+        # The zip contains a top-level 'train2017/' folder with images
+        # Extract directly under images_dir so we end up with images/train2017/
+        safe_extract_zip(train_zip, images_dir)
     else:
         print("images/train2017 already exists, skipping extract")
 
     if not (images_dir / "val2017").exists():
         print("Extracting val2017 images...")
-        safe_extract_zip(val_zip, out_dir)
-        (out_dir / "val2017").rename(images_dir / "val2017")
+        # The zip contains a top-level 'val2017/' folder with images
+        safe_extract_zip(val_zip, images_dir)
     else:
         print("images/val2017 already exists, skipping extract")
 
