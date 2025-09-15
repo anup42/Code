@@ -329,8 +329,10 @@ class Trainer:
                     union = area_p + area_g - inter + 1e-9
                     iou_w = inter / union  # [M]
                     # Optional: keep top-K points by IoU to limit compute
-                    Kp = tf.minimum(tf.shape(iou_w)[0], tf.constant(4096, dtype=tf.int32))
-                    top_vals, top_idx = tf.math.top_k(iou_w, k=Kp)
+                    # Run top-k on CPU to avoid GPU scatter/segment kernels in gradients
+                    with tf.device('/CPU:0'):
+                        Kp = tf.minimum(tf.shape(iou_w)[0], tf.constant(4096, dtype=tf.int32))
+                        top_vals, top_idx = tf.math.top_k(iou_w, k=Kp)
                     i_sel = top_idx
                     w = top_vals  # [Kp]
                     # Gather predictions for selected points
@@ -364,7 +366,9 @@ class Trainer:
                 K = tf.minimum(HW, tf.constant(512, dtype=tf.int32))
                 rnd = tf.random.uniform([B, HW], dtype=tf.float32)
                 scores = tf.where(neg_mask_points, rnd, tf.fill([B, HW], -1.0))
-                _, neg_idx = tf.math.top_k(scores, k=K)
+                # Run top-k on CPU as well
+                with tf.device('/CPU:0'):
+                    _, neg_idx = tf.math.top_k(scores, k=K)
                 pred_neg_cls = self._gather_cpu(cls_map, neg_idx, batch_dims=1)  # [B, K, C]
                 zero_tgt = tf.zeros_like(pred_neg_cls)
                 neg_ce = bce_with_logits_loss(pred_neg_cls, zero_tgt)
