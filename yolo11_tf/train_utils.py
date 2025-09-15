@@ -337,10 +337,11 @@ class Trainer:
                 with tf.device('/CPU:0'):
                     pos_points = tf.zeros([B, HW], dtype=tf.bool)
                     m = tf.shape(b_idx)[0]
-                    if tf.greater(m, 0):
+                    def _do_scatter():
                         idxs = tf.stack([b_idx, lin_idx], axis=1)  # [M,2]
                         updates = tf.ones([m], dtype=tf.bool)
-                        pos_points = tf.scatter_nd(idxs, updates, [B, HW])
+                        return tf.scatter_nd(idxs, updates, [B, HW])
+                    pos_points = tf.cond(m > 0, _do_scatter, lambda: pos_points)
                     pos_points = tf.stop_gradient(pos_points)
                 neg_mask_points = tf.logical_not(pos_points)
                 # Sample up to K negatives per image by top-k random scores over negatives
