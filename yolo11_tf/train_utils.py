@@ -331,11 +331,17 @@ class Trainer:
                     total_obj += obj_pos_loss2
 
                 # Background negative classification sampling to teach background separation
-                # Build [B, HW] mask of positive points
-                pos_points = tf.zeros([B, HW], dtype=tf.bool)
-                if tf.shape(b_idx)[0] > 0:
-                    updates = tf.ones([tf.shape(b_idx)[0]], dtype=tf.bool)
-                    pos_points = tf.tensor_scatter_nd_update(pos_points, tf.stack([b_idx, lin_idx], axis=1), updates)
+                # Build [B, HW] mask of positive points.
+                # Note: Some GPU stacks crash in UnsortedSegmentFunctor when scattering; do this on CPU
+                # and stop gradient as it is only used for sampling, not learning signals.
+                with tf.device('/CPU:0'):
+                    pos_points = tf.zeros([B, HW], dtype=tf.bool)
+                    m = tf.shape(b_idx)[0]
+                    if tf.greater(m, 0):
+                        idxs = tf.stack([b_idx, lin_idx], axis=1)  # [M,2]
+                        updates = tf.ones([m], dtype=tf.bool)
+                        pos_points = tf.scatter_nd(idxs, updates, [B, HW])
+                    pos_points = tf.stop_gradient(pos_points)
                 neg_mask_points = tf.logical_not(pos_points)
                 # Sample up to K negatives per image by top-k random scores over negatives
                 K = tf.minimum(HW, tf.constant(512, dtype=tf.int32))
