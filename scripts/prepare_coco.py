@@ -143,7 +143,7 @@ def prepare_coco(out_dir: Path):
     downloads = out_dir / "_downloads"
     images_dir = out_dir / "images"
     labels_dir = out_dir / "labels"
-    ann_dir = out_dir / "annotations"
+    ann_dir = out_dir  # annotations zip extracts to out_dir/annotations
 
     print(f"Preparing COCO2017 at: {out_dir}")
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -169,6 +169,7 @@ def prepare_coco(out_dir: Path):
         print("annotations_trainval2017.zip already exists, skipping download")
 
     # 2) Extract
+    images_dir.mkdir(parents=True, exist_ok=True)
     if not (images_dir / "train2017").exists():
         print("Extracting train2017 images...")
         safe_extract_zip(train_zip, out_dir)
@@ -187,8 +188,7 @@ def prepare_coco(out_dir: Path):
     if not (ann_dir / "annotations" / "instances_train2017.json").exists():
         print("Extracting annotations...")
         safe_extract_zip(ann_zip, out_dir)
-        # creates annotations/ at out_dir
-        (out_dir / "annotations").rename(ann_dir / "annotations")
+        # annotations/ is created at out_dir by the zip; no rename needed
     else:
         print("annotations already exists, skipping extract")
 
@@ -224,4 +224,3 @@ def parse_args():
 if __name__ == "__main__":
     args = parse_args()
     prepare_coco(Path(args.out))
-
