@@ -193,7 +193,7 @@ class Trainer:
 
         return pos_idx_list, pos_targ_list
 
-    @tf.function(experimental_relax_shapes=True)
+    @tf.function(jit_compile=False, experimental_relax_shapes=True)
     def train_step(self, images, targets):
         with tf.GradientTape() as tape:
             outputs = self.model(images, training=True)
@@ -361,10 +361,10 @@ class Trainer:
                     union = area_p + area_g - inter + 1e-9
                     iou_w = inter / union  # [M]
                     # Keep top-K by IoU; prefer GPU placement for speed
-                    M = tf.shape(iou_w)[0]
+                    M = tf.shape(iou_w_sg)[0]
                     Kp = tf.minimum(M, tf.constant(self.cfg.cr_topk_limit, dtype=tf.int32))
                     def _do_topk():
-                        res = self._top_k(iou_w, k=Kp)
+                        res = self._top_k(iou_w_sg, k=Kp)
                         return res.values, res.indices
                     def _empty():
                         return tf.zeros([0], dtype=iou_w.dtype), tf.zeros([0], dtype=tf.int32)
