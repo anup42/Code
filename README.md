@@ -26,6 +26,17 @@ Install
 - `pip install tensorflow pillow numpy pyyaml`
   - GPU: install a matching TensorFlow build per your CUDA/CUDNN.
 
+Quick GPU Environment (Conda)
+- Windows (PowerShell):
+  - `pwsh -File scripts/setup_conda_tf_gpu.ps1 -EnvName yolo11-tf -TFVersion 2.17.1`
+  - Then: `conda activate yolo11-tf`
+- Linux/macOS (bash):
+  - `bash scripts/setup_conda_tf_gpu.sh -n yolo11-tf -t 2.17.1`
+  - Then: `conda activate yolo11-tf`
+- The scripts install TensorFlow with bundled CUDA/cuDNN and verify GPU visibility. For extra stability on some stacks, disable XLA during training:
+  - Windows PowerShell: `$env:TF_XLA_FLAGS="--tf_xla_auto_jit=0"`
+  - Linux/macOS: `export TF_XLA_FLAGS=--tf_xla_auto_jit=0`
+
 Train
 - Typical command (YOLO-style YAML):
   - Linux/macOS:
