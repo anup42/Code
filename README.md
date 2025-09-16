@@ -27,9 +27,15 @@ Install
   - GPU: install a matching TensorFlow build per your CUDA/CUDNN.
 
 Train
-- Example (YOLO-style YAML):
-  - `python train.py --data C:/path/to/data.yaml --imgsz 640 --batch 8 --epochs 100 --model_scale s`
-- Weights are saved to `runs/train/exp/` as `weights_epoch*.h5` and `best.h5`.
+- Typical command (YOLO-style YAML):
+  - Linux/macOS:
+    - `python train.py --data /path/to/data.yaml --imgsz 640 --batch 16 --epochs 100 --model_scale s --out runs/train/exp`
+  - Windows (PowerShell):
+    - `python train.py --data C:\path\to\data.yaml --imgsz 640 --batch 16 --epochs 100 --model_scale s --out runs\train\exp`
+- Optional stability flag (recommended on some GPU setups):
+  - Linux/macOS: `export TF_XLA_FLAGS=--tf_xla_auto_jit=0`
+  - Windows PowerShell: `$env:TF_XLA_FLAGS="--tf_xla_auto_jit=0"`
+- Weights/logs are written under `--out` (default `runs/train/exp`).
 
 COCO2017
 - Prepare dataset (downloads images and annotations, converts to YOLO labels, writes YAML):
@@ -39,18 +45,12 @@ COCO2017
   - Adjust `--batch` and `--epochs` per your hardware.
 
 COCO128 Quickstart
-- Download the tiny COCO128 dataset via Ultralytics (optional, for a fast smoke test):
-  - `pip install ultralytics`
-  - `yolo download dataset=coco128`
-- Use the Ultralytics YAML directly for a quick train/eval run (80 classes):
-  - On most installs, you can reference the YAML at:
-    - `python - <<"PY"
-import inspect, os, ultralytics
-print(os.path.join(os.path.dirname(inspect.getfile(ultralytics)), 'cfg', 'datasets', 'coco128.yaml'))
-PY`
-  - Then train 1 epoch for a quick sanity check (replace <path-to-coco128.yaml>):
-    - `python train.py --data <path-to-coco128.yaml> --imgsz 640 --batch 16 --epochs 1 --model_scale n --out runs/train/coco128`
-- Optional inference on COCO128 val images after training:
+- Prepare the tiny dataset locally (downloads and writes a YAML):
+  - `python scripts/prepare_coco128.py --out datasets`
+  - This creates `datasets/coco128.yaml` and extracts images/labels to `datasets/coco128/`.
+- Train a small model for a quick smoke test:
+  - `python train.py --data datasets/coco128.yaml --imgsz 640 --batch 16 --epochs 1 --model_scale n --out runs/train/coco128`
+- Optional inference on coco128 val images after training:
   - `python test.py --weights runs/train/coco128/best.h5 --classes 80 --imgsz 640 --source datasets/coco128/images/val --conf 0.25 --iou 0.7`
 
 Inference
