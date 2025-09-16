@@ -99,9 +99,6 @@ class Trainer:
 
             # Initialize with -1 indices (no assignment)
             pos_idx = tf.fill([B, maxb], tf.constant(-1, dtype=tf.int32))
-            cls_t = tf.zeros([B, maxb, C], dtype=tf.float32)
-            ltrb_t = tf.zeros([B, maxb, 4], dtype=tf.float32)
-            box_t = tf.zeros([B, maxb, 4], dtype=tf.float32)
 
             cls_ids = tf.cast(targets[..., 0], tf.int32)
             x1, y1, x2, y2, v = tf.split(targets[..., 1:6], [1, 1, 1, 1, 1], axis=-1)
@@ -149,44 +146,59 @@ class Trainer:
             # Mask out invalids by setting idx to -1
             pos_idx = tf.where(scale_mask, chosen, tf.fill(tf.shape(chosen), tf.constant(-1, dtype=tf.int32)))
 
-            # Build targets for valid ones
+            # Build targets for valid ones without scatter updates (GPU kernels were unstable)
             valid_mask = scale_mask
-            b_idx = tf.where(valid_mask)
-            b_idx = tf.cast(b_idx, tf.int32)
-            if tf.shape(b_idx)[0] > 0:
-                # b_idx gives indices into [B, maxb]
-                bb = b_idx[:, 0]
-                gg = b_idx[:, 1]
-                # gather point coords
-                pidx = tf.gather_nd(pos_idx, b_idx)  # [M]
-                pxy = tf.gather(pts, pidx)
-                # gather boxes
-                gx1 = tf.gather_nd(tf.squeeze(x1, -1), b_idx)
-                gy1 = tf.gather_nd(tf.squeeze(y1, -1), b_idx)
-                gx2 = tf.gather_nd(tf.squeeze(x2, -1), b_idx)
-                gy2 = tf.gather_nd(tf.squeeze(y2, -1), b_idx)
-                boxes = tf.stack([gx1, gy1, gx2, gy2], axis=-1)
-                # ltrb distances in stride units
-                l = (pxy[:, 0] - gx1) / float(stride)
-                t = (pxy[:, 1] - gy1) / float(stride)
-                r = (gx2 - pxy[:, 0]) / float(stride)
-                b = (gy2 - pxy[:, 1]) / float(stride)
-                dists = tf.stack([l, t, r, b], axis=-1)
+            mask_f = tf.cast(valid_mask, tf.float32)
 
-                # clamp to [0, reg_max]
-                dists = tf.clip_by_value(dists, 0.0, float(self.cfg.reg_max))
+            # Class one-hot targets with masking and optional sanity checks
+            cls_ids_masked = tf.where(valid_mask, cls_ids, tf.zeros_like(cls_ids))
+            max_cls = tf.constant(self.cfg.num_classes, dtype=cls_ids_masked.dtype)
+            cls_in_range = tf.logical_and(cls_ids_masked >= 0, cls_ids_masked < max_cls)
+            cls_valid_mask = tf.logical_and(valid_mask, cls_in_range)
+            if getattr(self.cfg, 'debug_asserts', False):
+                cls_vals = tf.boolean_mask(cls_ids_masked, valid_mask)
+                def _check_cls():
+                    with tf.control_dependencies([
+                        tf.debugging.assert_greater_equal(tf.reduce_min(cls_vals), 0, message="cls ids negative"),
+                        tf.debugging.assert_less(tf.reduce_max(cls_vals), max_cls, message="cls ids >= num_classes"),
+                    ]):
+                        return tf.constant(0, dtype=cls_vals.dtype)
+                _ = tf.cond(tf.size(cls_vals) > 0, _check_cls, lambda: tf.constant(0, dtype=cls_vals.dtype))
+            cls_ids_safe = tf.where(cls_valid_mask, cls_ids_masked, tf.zeros_like(cls_ids_masked))
+            cls_oh_full = tf.one_hot(cls_ids_safe, depth=self.cfg.num_classes, dtype=tf.float32)
+            cls_t = cls_oh_full * tf.cast(cls_valid_mask[..., None], tf.float32)
 
-                # write into tensors
-                cls_oh = tf.one_hot(tf.gather_nd(cls_ids, b_idx), depth=self.cfg.num_classes)
-                if getattr(self.cfg, 'prefer_gpu_ops', True):
-                    cls_t = tf.tensor_scatter_nd_update(cls_t, b_idx, cls_oh)
-                    ltrb_t = tf.tensor_scatter_nd_update(ltrb_t, b_idx, dists)
-                    box_t = tf.tensor_scatter_nd_update(box_t, b_idx, boxes)
-                else:
-                    with tf.device('/CPU:0'):
-                        cls_t = tf.tensor_scatter_nd_update(cls_t, b_idx, cls_oh)
-                        ltrb_t = tf.tensor_scatter_nd_update(ltrb_t, b_idx, dists)
-                        box_t = tf.tensor_scatter_nd_update(box_t, b_idx, boxes)
+            # Gather selected points for every GT (fallback to index 0 when invalid, later masked out)
+            safe_pos_idx = tf.where(valid_mask, pos_idx, tf.zeros_like(pos_idx))
+            if getattr(self.cfg, 'debug_asserts', False):
+                pos_vals = tf.boolean_mask(pos_idx, valid_mask)
+                def _check_pos():
+                    with tf.control_dependencies([
+                        tf.debugging.assert_greater_equal(tf.reduce_min(pos_vals), 0, message="pos_idx negative"),
+                        tf.debugging.assert_less(tf.reduce_max(pos_vals), tf.shape(pts)[0], message="pos_idx >= HW"),
+                    ]):
+                        return tf.constant(0, dtype=pos_vals.dtype)
+                _ = tf.cond(tf.size(pos_vals) > 0, _check_pos, lambda: tf.constant(0, dtype=pos_vals.dtype))
+            max_hw = tf.maximum(tf.shape(pts)[0] - 1, 0)
+            safe_pos_idx = tf.clip_by_value(safe_pos_idx, 0, max_hw)
+            safe_pos_idx_flat = tf.reshape(safe_pos_idx, [-1])
+            pts_full = tf.reshape(tf.gather(pts, safe_pos_idx_flat), [B, maxb, 2])
+
+            gx1_full = tf.squeeze(x1, -1)
+            gy1_full = tf.squeeze(y1, -1)
+            gx2_full = tf.squeeze(x2, -1)
+            gy2_full = tf.squeeze(y2, -1)
+
+            l = (pts_full[..., 0] - gx1_full) / float(stride)
+            t = (pts_full[..., 1] - gy1_full) / float(stride)
+            r = (gx2_full - pts_full[..., 0]) / float(stride)
+            b = (gy2_full - pts_full[..., 1]) / float(stride)
+            dists_full = tf.stack([l, t, r, b], axis=-1)
+            dists_full = tf.clip_by_value(dists_full, 0.0, float(self.cfg.reg_max))
+            ltrb_t = dists_full * mask_f[..., None]
+
+            boxes_full = tf.stack([gx1_full, gy1_full, gx2_full, gy2_full], axis=-1)
+            box_t = boxes_full * mask_f[..., None]
 
             pos_idx_list.append(pos_idx)
             pos_targ_list.append({"cls": cls_t, "ltrb": ltrb_t, "boxes": box_t})
@@ -360,6 +372,11 @@ class Trainer:
                     area_g = tf.maximum(0.0, (gbox[:, 2] - gbox[:, 0])) * tf.maximum(0.0, (gbox[:, 3] - gbox[:, 1]))
                     union = area_p + area_g - inter + 1e-9
                     iou_w = inter / union  # [M]
+                    # Stop gradients before selecting by IoU. Autograph lifted this tensor
+                    # out of the cond branch previously which meant it never existed when the
+                    # branch executed, leading to a NameError at runtime once the branch was
+                    # actually taken. Create the stop-gradient tensor explicitly here.
+                    iou_w_sg = tf.stop_gradient(iou_w)
                     # Keep top-K by IoU; prefer GPU placement for speed
                     M = tf.shape(iou_w_sg)[0]
                     Kp = tf.minimum(M, tf.constant(self.cfg.cr_topk_limit, dtype=tf.int32))
