@@ -20,6 +20,10 @@ class TrainConfig:
     box_loss_gain: float = 7.5
     dfl_loss_gain: float = 1.5
     max_boxes: int = 300
+    # Performance/stability knobs
+    prefer_gpu_ops: bool = True
+    debug_asserts: bool = False
+    cr_topk_limit: int = 4096
 
 
 class Trainer:
@@ -28,13 +32,15 @@ class Trainer:
         self.cfg = cfg
         self.optimizer = tf.keras.optimizers.Adam(learning_rate=cfg.lr)
 
-    @staticmethod
-    def _gather_cpu(x, indices, batch_dims=0):
+    def _gather_cpu(self, x, indices, batch_dims=0):
+        if getattr(self.cfg, 'prefer_gpu_ops', True):
+            return tf.gather(x, indices, batch_dims=batch_dims)
         with tf.device('/CPU:0'):
             return tf.gather(x, indices, batch_dims=batch_dims)
 
-    @staticmethod
-    def _gather_nd_cpu(x, indices):
+    def _gather_nd_cpu(self, x, indices):
+        if getattr(self.cfg, 'prefer_gpu_ops', True):
+            return tf.gather_nd(x, indices)
         with tf.device('/CPU:0'):
             return tf.gather_nd(x, indices)
 
@@ -164,13 +170,10 @@ class Trainer:
                 dists = tf.clip_by_value(dists, 0.0, float(self.cfg.reg_max))
 
                 # write into tensors
-                # Some GPU builds crash in UnsortedSegmentFunctor via TensorScatterUpdate.
-                # Perform these updates on CPU; these are target tensors (no gradients needed).
                 cls_oh = tf.one_hot(tf.gather_nd(cls_ids, b_idx), depth=self.cfg.num_classes)
-                with tf.device('/CPU:0'):
-                    cls_t = tf.tensor_scatter_nd_update(cls_t, b_idx, cls_oh)
-                    ltrb_t = tf.tensor_scatter_nd_update(ltrb_t, b_idx, dists)
-                    box_t = tf.tensor_scatter_nd_update(box_t, b_idx, boxes)
+                cls_t = tf.tensor_scatter_nd_update(cls_t, b_idx, cls_oh)
+                ltrb_t = tf.tensor_scatter_nd_update(ltrb_t, b_idx, dists)
+                box_t = tf.tensor_scatter_nd_update(box_t, b_idx, boxes)
 
             pos_idx_list.append(pos_idx)
             pos_targ_list.append({"cls": cls_t, "ltrb": ltrb_t, "boxes": box_t})
@@ -226,10 +229,9 @@ class Trainer:
                 lin_idx = tf.zeros([0], dtype=tf.int32)
                 if tf.shape(b_idx)[0] > 0:
                     # Compute linear indices on CPU for stability
-                    with tf.device('/CPU:0'):
-                        lin_idx = tf.gather_nd(idx, tf.stack([b_idx, g_idx], axis=1))  # [M]
-                    # Validate index range
-                    lin_idx = self._assert_indices_in_range(lin_idx, HW, name="lin_idx")
+                    lin_idx = tf.gather_nd(idx, tf.stack([b_idx, g_idx], axis=1))  # [M]
+                    if getattr(self.cfg, 'debug_asserts', False):
+                        lin_idx = self._assert_indices_in_range(lin_idx, HW, name="lin_idx")
                     pred_cls_sel = self._gather_cpu(cls_map, b_idx)
                     pred_cls_sel = self._gather_cpu(pred_cls_sel, lin_idx, batch_dims=1)  # [M, C]
 
@@ -345,16 +347,15 @@ class Trainer:
                     area_g = tf.maximum(0.0, (gbox[:, 2] - gbox[:, 0])) * tf.maximum(0.0, (gbox[:, 3] - gbox[:, 1]))
                     union = area_p + area_g - inter + 1e-9
                     iou_w = inter / union  # [M]
-                    # Keep top-K by IoU (CPU)
-                    with tf.device('/CPU:0'):
-                        M = tf.shape(iou_w)[0]
-                        Kp = tf.minimum(M, tf.constant(4096, dtype=tf.int32))
-                        def _do_topk():
-                            res = tf.math.top_k(iou_w, k=Kp)
-                            return res.values, res.indices
-                        def _empty():
-                            return tf.zeros([0], dtype=iou_w.dtype), tf.zeros([0], dtype=tf.int32)
-                        top_vals, top_idx = tf.cond(M > 0, _do_topk, _empty)
+                    # Keep top-K by IoU; prefer GPU placement for speed
+                    M = tf.shape(iou_w)[0]
+                    Kp = tf.minimum(M, tf.constant(self.cfg.cr_topk_limit, dtype=tf.int32))
+                    def _do_topk():
+                        res = tf.math.top_k(iou_w, k=Kp)
+                        return res.values, res.indices
+                    def _empty():
+                        return tf.zeros([0], dtype=iou_w.dtype), tf.zeros([0], dtype=tf.int32)
+                    top_vals, top_idx = tf.cond(M > 0, _do_topk, _empty)
                     i_sel = top_idx
                     w = top_vals
                     pred_cls_pts = self._gather_cpu(self._gather_cpu(cls_map, b_pos), i_sel, batch_dims=0)
@@ -377,27 +378,23 @@ class Trainer:
 
                 # Background negative classification sampling to teach background separation
                 # Build [B, HW] mask of positive points.
-                # Note: Some GPU stacks crash in UnsortedSegmentFunctor when scattering; do this on CPU
-                # and stop gradient as it is only used for sampling, not learning signals.
-                with tf.device('/CPU:0'):
-                    pos_points = tf.zeros([B, HW], dtype=tf.bool)
-                    m = tf.shape(b_idx)[0]
-                    def _do_scatter():
-                        idxs = tf.stack([b_idx, lin_idx], axis=1)  # [M,2]
-                        updates = tf.ones([m], dtype=tf.bool)
-                        return tf.scatter_nd(idxs, updates, [B, HW])
-                    pos_points = tf.cond(m > 0, _do_scatter, lambda: pos_points)
-                    pos_points = tf.stop_gradient(pos_points)
+                # Build mask of positives; stop gradient since it's used for sampling only
+                pos_points = tf.zeros([B, HW], dtype=tf.bool)
+                m = tf.shape(b_idx)[0]
+                def _do_scatter():
+                    idxs = tf.stack([b_idx, lin_idx], axis=1)
+                    updates = tf.ones([m], dtype=tf.bool)
+                    return tf.scatter_nd(idxs, updates, [B, HW])
+                pos_points = tf.cond(m > 0, _do_scatter, lambda: pos_points)
+                pos_points = tf.stop_gradient(pos_points)
                 neg_mask_points = tf.logical_not(pos_points)
                 # Sample up to K negatives per image by top-k random scores over negatives
                 K = tf.minimum(HW, tf.constant(512, dtype=tf.int32))
                 rnd = tf.random.uniform([B, HW], dtype=tf.float32)
                 scores = tf.where(neg_mask_points, rnd, tf.fill([B, HW], -1.0))
-                # Run top-k on CPU as well
-                with tf.device('/CPU:0'):
-                    _, neg_idx = tf.math.top_k(scores, k=K)
-                # Validate negative sample indices
-                _ = self._assert_indices_in_range(neg_idx, HW, name="neg_idx")
+                _, neg_idx = tf.math.top_k(scores, k=K)
+                if getattr(self.cfg, 'debug_asserts', False):
+                    _ = self._assert_indices_in_range(neg_idx, HW, name="neg_idx")
                 pred_neg_cls = self._gather_cpu(cls_map, neg_idx, batch_dims=1)  # [B, K, C]
                 zero_tgt = tf.zeros_like(pred_neg_cls)
                 neg_ce = bce_with_logits_loss(pred_neg_cls, zero_tgt)

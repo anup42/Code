@@ -236,3 +236,133 @@ def build_trainer_dataset(data_yaml: str, imgsz=640, batch_size=16, split="train
     ds = ds.batch(batch_size, drop_remainder=True)
     ds = ds.prefetch(tf.data.AUTOTUNE)
     return ds, num_classes
+
+
+# =====================
+# TFRecord support
+# =====================
+
+def _serialize_example(img_path: str):
+    """Read an image path + its YOLO label file and return serialized TF Example.
+
+    Stores:
+      - image: bytes (encoded original image)
+      - shape: int64[2] (h, w)
+      - labels: float32 list (flattened [N,5] rows [cls,cx,cy,w,h])
+    """
+    import cv2  # local import to avoid hard dep if user doesn't use TFRecords
+    p = img_path
+    with open(p, 'rb') as f:
+        img_bytes = f.read()
+    # get shape via cv2 decode for reliability
+    img = cv2.imdecode(np.frombuffer(img_bytes, np.uint8), cv2.IMREAD_COLOR)
+    h, w = img.shape[:2]
+    labels = read_label_file(img2label_path(p)).astype(np.float32)
+    labels_flat = labels.reshape(-1).astype(np.float32)
+
+    def _bytes_feature(v: bytes):
+        return tf.train.Feature(bytes_list=tf.train.BytesList(value=[v]))
+
+    def _int64_list(v):
+        return tf.train.Feature(int64_list=tf.train.Int64List(value=v))
+
+    def _float_list(v):
+        return tf.train.Feature(float_list=tf.train.FloatList(value=v))
+
+    ex = tf.train.Example(features=tf.train.Features(feature={
+        'image': _bytes_feature(img_bytes),
+        'shape': _int64_list([int(h), int(w)]),
+        'labels': _float_list(labels_flat.tolist()),
+    }))
+    return ex.SerializeToString()
+
+
+def write_tfrecords_from_yaml(data_yaml: str, out_dir: str, split: str = 'train', shards: int = 8):
+    train, val, _ = load_yolo_yaml(data_yaml)
+    src = train if split == 'train' else val
+    files = build_file_list(src)
+    out_dir = os.path.join(out_dir, split)
+    os.makedirs(out_dir, exist_ok=True)
+    n = len(files)
+    per = max(1, n // shards)
+    writers = []
+    for s in range(shards):
+        writers.append(tf.io.TFRecordWriter(os.path.join(out_dir, f"{split}-{s:03d}.tfrecord")))
+    try:
+        for i, p in enumerate(files):
+            ex = _serialize_example(p)
+            writers[(i // per) % shards].write(ex)
+    finally:
+        for w in writers:
+            w.close()
+    return out_dir
+
+
+def build_trainer_dataset_from_tfrecord(tfrec_glob: str, imgsz=640, batch_size=16, shuffle=True,
+                                        num_parallel_calls=tf.data.AUTOTUNE, max_labels=300):
+    feature_spec = {
+        'image': tf.io.FixedLenFeature([], tf.string),
+        'shape': tf.io.FixedLenFeature([2], tf.int64),
+        'labels': tf.io.VarLenFeature(tf.float32),
+    }
+
+    def _parse(rec):
+        ex = tf.io.parse_single_example(rec, feature_spec)
+        img = tf.image.decode_image(ex['image'], channels=3, expand_animations=False)
+        img = tf.cast(img, tf.float32)
+        h0 = tf.cast(ex['shape'][0], tf.int32)
+        w0 = tf.cast(ex['shape'][1], tf.int32)
+        labels = tf.sparse.to_dense(ex['labels'])
+        labels = tf.reshape(labels, [-1, 5])  # [N,5]
+        # Letterbox
+        lb_img, scale, pad_top, pad_left = letterbox(img, new_shape=imgsz)
+        new_h, new_w = imgsz, imgsz
+        # Adjust labels to normalized in new image size
+        if tf.shape(labels)[0] > 0:
+            cls = labels[:, 0:1]
+            xywhn = labels[:, 1:5]
+            cx = xywhn[:, 0] * tf.cast(w0, tf.float32)
+            cy = xywhn[:, 1] * tf.cast(h0, tf.float32)
+            ww = xywhn[:, 2] * tf.cast(w0, tf.float32)
+            hh = xywhn[:, 3] * tf.cast(h0, tf.float32)
+            cx = cx * scale + tf.cast(pad_left, tf.float32)
+            cy = cy * scale + tf.cast(pad_top, tf.float32)
+            ww = ww * scale
+            hh = hh * scale
+            cxn = cx / float(new_w)
+            cyn = cy / float(new_h)
+            wwn = ww / float(new_w)
+            hhn = hh / float(new_h)
+            labels_adj = tf.stack([tf.squeeze(cls, 1), cxn, cyn, wwn, hhn], axis=-1)
+        else:
+            labels_adj = tf.zeros((0, 5), dtype=tf.float32)
+        # Pad to fixed max_labels
+        n = tf.shape(labels_adj)[0]
+        k = tf.minimum(n, tf.constant(max_labels, tf.int32))
+        labels_adj = labels_adj[:k]
+        pad_rows = tf.maximum(0, max_labels - k)
+        labels_adj = tf.pad(labels_adj, [[0, pad_rows], [0, 0]])
+        # Convert to Trainer targets [max_labels,6] in pixel coords
+        cls = labels_adj[:, 0:1]
+        cx = labels_adj[:, 1:2]
+        cy = labels_adj[:, 2:3]
+        w = labels_adj[:, 3:4]
+        h = labels_adj[:, 4:5]
+        x1 = (cx - 0.5 * w) * float(imgsz)
+        y1 = (cy - 0.5 * h) * float(imgsz)
+        x2 = (cx + 0.5 * w) * float(imgsz)
+        y2 = (cy + 0.5 * h) * float(imgsz)
+        valid = tf.cast((w > 0) & (h > 0), tf.float32)
+        t = tf.concat([cls, x1, y1, x2, y2, valid], axis=-1)
+        lb_img = lb_img / 255.0
+        return lb_img, t
+
+    files = tf.io.gfile.glob(os.path.join(tfrec_glob, '*.tfrecord')) if os.path.isdir(tfrec_glob) else tf.io.gfile.glob(tfrec_glob)
+    ds = tf.data.TFRecordDataset(files, num_parallel_reads=tf.data.AUTOTUNE)
+    if shuffle:
+        ds = ds.shuffle(buffer_size=8192)
+    ds = ds.map(_parse, num_parallel_calls=num_parallel_calls)
+    ds = ds.batch(batch_size, drop_remainder=True)
+    ds = ds.prefetch(tf.data.AUTOTUNE)
+    # Return dataset and infer num_classes from labels (user still provides via YAML typically)
+    return ds

@@ -21,6 +21,9 @@ def parse_args():
     ap.add_argument("--steps_per_epoch", type=int, default=0, help="Override steps per epoch; if >0, run validation after N steps and increment epoch")
     ap.add_argument("--val_steps", type=int, default=0, help="Optional cap on validation steps per epoch (0 = use full val set)")
     ap.add_argument("--cache", action="store_true", help="Cache training dataset in memory for speed (small datasets)")
+    ap.add_argument("--tfrecord", type=str, default="", help="Optional path/glob to TFRecord files (overrides --data loader)")
+    ap.add_argument("--fast", action="store_true", help="Prefer GPU kernels for gather/top-k/scatter (faster, default)")
+    ap.add_argument("--debug_asserts", action="store_true", help="Enable runtime index assertions (slower)")
     return ap.parse_args()
 
 
@@ -66,8 +69,15 @@ def main():
     # Local imports for dataset utilities
     from yolo11_tf.data import load_yolo_yaml, build_file_list
 
-    train_ds, num_classes = build_trainer_dataset(args.data, imgsz=args.imgsz, batch_size=args.batch, split="train", shuffle=True)
-    val_ds, _ = build_trainer_dataset(args.data, imgsz=args.imgsz, batch_size=args.batch, split="val", shuffle=False)
+    if args.tfrecord:
+        from yolo11_tf.data import build_trainer_dataset_from_tfrecord, load_yolo_yaml
+        train_ds = build_trainer_dataset_from_tfrecord(args.tfrecord if '*' in args.tfrecord or args.tfrecord.endswith('.tfrecord') else args.tfrecord + "/train", imgsz=args.imgsz, batch_size=args.batch, shuffle=True)
+        # num_classes from YAML still required for metrics
+        _, _, num_classes = load_yolo_yaml(args.data)
+        val_ds = build_trainer_dataset_from_tfrecord(args.tfrecord if '*' in args.tfrecord or args.tfrecord.endswith('.tfrecord') else args.tfrecord + "/val", imgsz=args.imgsz, batch_size=args.batch, shuffle=False)
+    else:
+        train_ds, num_classes = build_trainer_dataset(args.data, imgsz=args.imgsz, batch_size=args.batch, split="train", shuffle=True)
+        val_ds, _ = build_trainer_dataset(args.data, imgsz=args.imgsz, batch_size=args.batch, split="val", shuffle=False)
     # Steps per epoch
     train_dir, val_dir, _ = load_yolo_yaml(args.data)
     train_files = build_file_list(train_dir)
@@ -91,7 +101,8 @@ def main():
     width_mult, depth_mult = scale_to_multipliers(args.model_scale)
     model = build_yolo11(num_classes=num_classes, width_mult=width_mult, depth_mult=depth_mult)
 
-    cfg = TrainConfig(num_classes=num_classes, img_size=args.imgsz, reg_max=16, lr=args.lr)
+    cfg = TrainConfig(num_classes=num_classes, img_size=args.imgsz, reg_max=16, lr=args.lr,
+                      prefer_gpu_ops=bool(args.fast or True), debug_asserts=bool(args.debug_asserts))
     trainer = Trainer(model, cfg)
 
     # TensorBoard writer for charts (kept)

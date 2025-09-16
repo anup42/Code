@@ -37,6 +37,19 @@ Quick GPU Environment (Conda)
   - Windows PowerShell: `$env:TF_XLA_FLAGS="--tf_xla_auto_jit=0"`
   - Linux/macOS: `export TF_XLA_FLAGS=--tf_xla_auto_jit=0`
 
+Performance Tips
+- Prefer GPU kernels for gathers/top-k/scatters (faster): default behavior. If you previously enabled CPU fallbacks for stability, re-enable GPU via `--fast` (default on) and keep `TF_XLA_FLAGS=--tf_xla_auto_jit=0` to avoid XLA issues.
+- Reduce validation frequency or `--val_steps` during early training.
+- Use `--cache` for small datasets to keep decoded samples in memory.
+- Use TFRecords to reduce file I/O overhead (see below).
+
+TFRecords (optional, faster I/O)
+- Create TFRecords from a YOLO-format dataset YAML:
+  - Windows: `python scripts/make_tfrecords.py --data datasets\coco2017.yaml --out datasets\coco2017_tfrec --shards 16`
+  - Linux/macOS: `python scripts/make_tfrecords.py --data datasets/coco2017.yaml --out datasets/coco2017_tfrec --shards 16`
+- Train using TFRecords (overrides the default loader) while still providing the YAML for class names/metrics:
+  - `python train.py --data datasets/coco2017.yaml --tfrecord datasets/coco2017_tfrec --imgsz 640 --batch 16 --epochs 100`
+
 Train
 - Typical command (YOLO-style YAML):
   - Linux/macOS:
