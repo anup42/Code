@@ -51,6 +51,26 @@ class Trainer:
         with tf.device('/CPU:0'):
             return tf.math.top_k(values, k=k)
 
+    def _scatter_nd(self, indices, updates, shape):
+        """Scatter helper that keeps bool updates on CPU to avoid GPU kernel crashes.
+
+        TensorFlow's GPU `tf.scatter_nd` implementation for boolean tensors routes
+        through an `UnsortedSegment` kernel whose launch configuration can overflow
+        for typical detection head shapes (tens of thousands of elements). On recent
+        TF/CUDA stacks this manifests as a fatal
+        `gpu_launch_config.h:129 Check failed: work_element_count >= 0` abort during
+        training. Running the scatter on the CPU sidesteps the buggy GPU path while
+        keeping the behaviour identical for our small boolean masks. Numerical
+        tensors continue to honour the `prefer_gpu_ops` flag for performance.
+        """
+
+        prefer_gpu = getattr(self.cfg, 'prefer_gpu_ops', True)
+        # Force CPU for boolean updates even when prefer_gpu_ops is True.
+        if updates.dtype == tf.bool or not prefer_gpu:
+            with tf.device('/CPU:0'):
+                return tf.scatter_nd(indices, updates, shape)
+        return tf.scatter_nd(indices, updates, shape)
+
     @staticmethod
     def _assert_indices_in_range(idx: tf.Tensor, upper: tf.Tensor, name: str = "idx"):
         """Assert idx in [0, upper). Returns identity of idx with control deps.
@@ -414,10 +434,7 @@ class Trainer:
                 def _do_scatter():
                     idxs = tf.stack([b_idx, lin_idx], axis=1)
                     updates = tf.ones([m], dtype=tf.bool)
-                    if getattr(self.cfg, 'prefer_gpu_ops', True):
-                        return tf.scatter_nd(idxs, updates, [B, HW])
-                    with tf.device('/CPU:0'):
-                        return tf.scatter_nd(idxs, updates, [B, HW])
+                    return self._scatter_nd(idxs, updates, [B, HW])
                 pos_points = tf.cond(m > 0, _do_scatter, lambda: pos_points)
                 pos_points = tf.stop_gradient(pos_points)
                 neg_mask_points = tf.logical_not(pos_points)
