@@ -10,6 +10,12 @@ from urllib.request import urlopen, Request
 from urllib.error import URLError, HTTPError
 import zipfile
 
+# Allow running directly by ensuring repo root is on sys.path
+try:
+    import yolo11_tf  # noqa: F401
+except ModuleNotFoundError:
+    sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 
 COCO_TRAIN_ZIP = "http://images.cocodataset.org/zips/train2017.zip"
 COCO_VAL_ZIP = "http://images.cocodataset.org/zips/val2017.zip"
