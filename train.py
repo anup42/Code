@@ -41,6 +41,15 @@ def main():
 
     # Enable GPU memory growth to avoid full allocation
     try:
+        # Print TensorFlow version and build info for easier debugging
+        try:
+            print(f"TensorFlow version: {tf.__version__}", flush=True)
+            bi = tf.sysconfig.get_build_info()
+            cuda_v = bi.get('cuda_version', '?')
+            cudnn_v = bi.get('cudnn_version', '?')
+            print(f"TF build CUDA: {cuda_v} cuDNN: {cudnn_v}", flush=True)
+        except Exception:
+            pass
         gpus = tf.config.list_physical_devices('GPU')
         if gpus:
             for gpu in gpus:
@@ -48,7 +57,7 @@ def main():
                     tf.config.experimental.set_memory_growth(gpu, True)
                 except Exception:
                     pass
-            print(f"Using {len(gpus)} GPU(s) with memory growth enabled", flush=True)
+            print(f"Using {len(gpus)} GPU(s) with memory growth enabled: {gpus}", flush=True)
         else:
             print("No GPU found, running on CPU", flush=True)
     except Exception as e:
