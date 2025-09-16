@@ -44,6 +44,13 @@ class Trainer:
         with tf.device('/CPU:0'):
             return tf.gather_nd(x, indices)
 
+    def _top_k(self, values, k):
+        """Top-k with optional CPU placement for stability when prefer_gpu_ops=False."""
+        if getattr(self.cfg, 'prefer_gpu_ops', True):
+            return tf.math.top_k(values, k=k)
+        with tf.device('/CPU:0'):
+            return tf.math.top_k(values, k=k)
+
     @staticmethod
     def _assert_indices_in_range(idx: tf.Tensor, upper: tf.Tensor, name: str = "idx"):
         """Assert idx in [0, upper). Returns identity of idx with control deps.
@@ -357,7 +364,7 @@ class Trainer:
                     M = tf.shape(iou_w)[0]
                     Kp = tf.minimum(M, tf.constant(self.cfg.cr_topk_limit, dtype=tf.int32))
                     def _do_topk():
-                        res = tf.math.top_k(iou_w, k=Kp)
+                        res = self._top_k(iou_w, k=Kp)
                         return res.values, res.indices
                     def _empty():
                         return tf.zeros([0], dtype=iou_w.dtype), tf.zeros([0], dtype=tf.int32)
@@ -401,7 +408,8 @@ class Trainer:
                 K = tf.minimum(HW, tf.constant(512, dtype=tf.int32))
                 rnd = tf.random.uniform([B, HW], dtype=tf.float32)
                 scores = tf.where(neg_mask_points, rnd, tf.fill([B, HW], -1.0))
-                _, neg_idx = tf.math.top_k(scores, k=K)
+                res_neg = self._top_k(scores, k=K)
+                _, neg_idx = res_neg.values, res_neg.indices
                 if getattr(self.cfg, 'debug_asserts', False):
                     _ = self._assert_indices_in_range(neg_idx, HW, name="neg_idx")
                 pred_neg_cls = self._gather_cpu(cls_map, neg_idx, batch_dims=1)  # [B, K, C]
