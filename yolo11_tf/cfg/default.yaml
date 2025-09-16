@@ -1,0 +1,28 @@
+# Default training and augmentation settings for YOLO11-TF
+train:
+  imgsz: 640
+  batch: 16
+  epochs: 100
+  lr0: 0.001
+  warmup_epochs: 3.0
+  weight_decay: 0.0005
+loss:
+  box: 7.5
+  cls: 0.5
+  dfl: 1.5
+augmentation:
+  mosaic: 1.0
+  mixup: 0.0
+  mixup_beta: 8.0
+  mosaic_scale: [0.5, 1.5]
+  hsv_h: 0.015
+  hsv_s: 0.7
+  hsv_v: 0.4
+  degrees: 0.0
+  translate: 0.1
+  scale: 0.5
+  shear: 0.0
+  perspective: 0.0
+  flipud: 0.0
+  fliplr: 0.5
+  pad_val: 114.0
