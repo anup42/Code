@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from typing import List, Tuple
 
 from .utils import list_images_from_dir, img2label_path, read_yaml, letterbox
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
+import os
 
 
 @dataclass
@@ -250,13 +252,14 @@ def _serialize_example(img_path: str):
       - shape: int64[2] (h, w)
       - labels: float32 list (flattened [N,5] rows [cls,cx,cy,w,h])
     """
-    import cv2  # local import to avoid hard dep if user doesn't use TFRecords
+    from io import BytesIO
+    from PIL import Image  # light dependency, commonly available; avoids cv2 requirement
     p = img_path
     with open(p, 'rb') as f:
         img_bytes = f.read()
-    # get shape via cv2 decode for reliability
-    img = cv2.imdecode(np.frombuffer(img_bytes, np.uint8), cv2.IMREAD_COLOR)
-    h, w = img.shape[:2]
+    # Determine shape by decoding headers
+    with Image.open(BytesIO(img_bytes)) as im:
+        w, h = im.size
     labels = read_label_file(img2label_path(p)).astype(np.float32)
     labels_flat = labels.reshape(-1).astype(np.float32)
 
@@ -277,7 +280,20 @@ def _serialize_example(img_path: str):
     return ex.SerializeToString()
 
 
-def write_tfrecords_from_yaml(data_yaml: str, out_dir: str, split: str = 'train', shards: int = 8):
+def _serialize_example_idx(args):
+    i, p = args
+    return i, _serialize_example(p)
+
+
+def write_tfrecords_from_yaml(
+    data_yaml: str,
+    out_dir: str,
+    split: str = 'train',
+    shards: int = 8,
+    update_every: int = 10,
+    num_workers: int | None = None,
+    use_processes: bool = False,
+):
     train, val, _ = load_yolo_yaml(data_yaml)
     src = train if split == 'train' else val
     files = build_file_list(src)
@@ -288,10 +304,50 @@ def write_tfrecords_from_yaml(data_yaml: str, out_dir: str, split: str = 'train'
     writers = []
     for s in range(shards):
         writers.append(tf.io.TFRecordWriter(os.path.join(out_dir, f"{split}-{s:03d}.tfrecord")))
+    # Progress bar
+    pb = None
+    if n > 0:
+        try:
+            pb = tf.keras.utils.Progbar(n, unit_name='img')
+        except Exception:
+            pb = None
+    import time
+    t0 = time.time()
     try:
-        for i, p in enumerate(files):
-            ex = _serialize_example(p)
-            writers[(i // per) % shards].write(ex)
+        # Parallel serialization (threads by default for portability; opt-in processes)
+        if num_workers is None or num_workers <= 0:
+            try:
+                num_workers = max(1, (os.cpu_count() or 4) // 2)
+            except Exception:
+                num_workers = 4
+        if num_workers == 1:
+            # Sequential fallback
+            for i, p in enumerate(files):
+                ex = _serialize_example(p)
+                writers[(i // per) % shards].write(ex)
+                if pb is not None:
+                    done = i + 1
+                    if (done % max(1, int(update_every)) == 0) or (done == n):
+                        dt = max(1e-9, time.time() - t0)
+                        ips = done / dt
+                        remaining = n - done
+                        eta = remaining / ips if ips > 0 else 0.0
+                        pb.update(done, values=[("ips", ips), ("eta_s", eta)])
+        else:
+            Executor = ProcessPoolExecutor if use_processes else ThreadPoolExecutor
+            with Executor(max_workers=num_workers) as ex_pool:
+                futs = [ex_pool.submit(_serialize_example_idx, (i, p)) for i, p in enumerate(files)]
+                done_count = 0
+                for fut in as_completed(futs):
+                    i, ser = fut.result()
+                    writers[(i // per) % shards].write(ser)
+                    done_count += 1
+                    if pb is not None and ((done_count % max(1, int(update_every)) == 0) or (done_count == n)):
+                        dt = max(1e-9, time.time() - t0)
+                        ips = done_count / dt
+                        remaining = n - done_count
+                        eta = remaining / ips if ips > 0 else 0.0
+                        pb.update(done_count, values=[("ips", ips), ("eta_s", eta)])
     finally:
         for w in writers:
             w.close()

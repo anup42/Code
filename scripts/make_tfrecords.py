@@ -15,6 +15,9 @@ def parse_args():
     ap.add_argument("--data", type=str, required=True, help="Path to data.yaml")
     ap.add_argument("--out", type=str, required=True, help="Output directory for TFRecords")
     ap.add_argument("--shards", type=int, default=8, help="Number of shards per split")
+    ap.add_argument("--update_every", type=int, default=25, help="Update progress bar every N images")
+    ap.add_argument("--workers", type=int, default=0, help="Parallel workers for serialization (0=auto)")
+    ap.add_argument("--mp", action="store_true", help="Use multiprocessing instead of threads")
     return ap.parse_args()
 
 
@@ -23,9 +26,11 @@ def main():
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     print("Writing train TFRecords...")
-    write_tfrecords_from_yaml(args.data, str(out), split='train', shards=args.shards)
+    write_tfrecords_from_yaml(args.data, str(out), split='train', shards=args.shards,
+                              update_every=args.update_every, num_workers=args.workers, use_processes=args.mp)
     print("Writing val TFRecords...")
-    write_tfrecords_from_yaml(args.data, str(out), split='val', shards=max(1, args.shards // 2))
+    write_tfrecords_from_yaml(args.data, str(out), split='val', shards=max(1, args.shards // 2),
+                              update_every=args.update_every, num_workers=args.workers, use_processes=args.mp)
     print(f"Done. TFRecords stored under {out}")
 
 
