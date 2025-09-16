@@ -44,9 +44,13 @@ Performance Tips
 - Use TFRecords to reduce file I/O overhead (see below).
 
 TFRecords (optional, faster I/O)
-- Create TFRecords from a YOLO-format dataset YAML:
-  - Windows: `python scripts/make_tfrecords.py --data datasets\coco2017.yaml --out datasets\coco2017_tfrec --shards 16`
-  - Linux/macOS: `python scripts/make_tfrecords.py --data datasets/coco2017.yaml --out datasets/coco2017_tfrec --shards 16`
+- Create TFRecords from a YOLO-format dataset YAML (with parallelism and throttled progress):
+  - Windows: `python scripts/make_tfrecords.py --data datasets\coco2017.yaml --out datasets\coco2017_tfrec --shards 32 --workers 8 --update_every 500`
+  - Linux/macOS: `python scripts/make_tfrecords.py --data datasets/coco2017.yaml --out datasets/coco2017_tfrec --shards 32 --workers 16 --mp --update_every 500`
+  - Flags:
+    - `--workers N`: parallel workers (default auto).
+    - `--mp`: use multiprocessing (recommended on Linux/macOS). Omit on Windows to keep threads.
+    - `--update_every K`: update the progress bar every K images (shows `ips` and `eta_s`).
 - Train using TFRecords (overrides the default loader) while still providing the YAML for class names/metrics:
   - `python train.py --data datasets/coco2017.yaml --tfrecord datasets/coco2017_tfrec --imgsz 640 --batch 16 --epochs 100`
 
