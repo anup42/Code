@@ -171,9 +171,15 @@ class Trainer:
 
                 # write into tensors
                 cls_oh = tf.one_hot(tf.gather_nd(cls_ids, b_idx), depth=self.cfg.num_classes)
-                cls_t = tf.tensor_scatter_nd_update(cls_t, b_idx, cls_oh)
-                ltrb_t = tf.tensor_scatter_nd_update(ltrb_t, b_idx, dists)
-                box_t = tf.tensor_scatter_nd_update(box_t, b_idx, boxes)
+                if getattr(self.cfg, 'prefer_gpu_ops', True):
+                    cls_t = tf.tensor_scatter_nd_update(cls_t, b_idx, cls_oh)
+                    ltrb_t = tf.tensor_scatter_nd_update(ltrb_t, b_idx, dists)
+                    box_t = tf.tensor_scatter_nd_update(box_t, b_idx, boxes)
+                else:
+                    with tf.device('/CPU:0'):
+                        cls_t = tf.tensor_scatter_nd_update(cls_t, b_idx, cls_oh)
+                        ltrb_t = tf.tensor_scatter_nd_update(ltrb_t, b_idx, dists)
+                        box_t = tf.tensor_scatter_nd_update(box_t, b_idx, boxes)
 
             pos_idx_list.append(pos_idx)
             pos_targ_list.append({"cls": cls_t, "ltrb": ltrb_t, "boxes": box_t})
@@ -384,7 +390,10 @@ class Trainer:
                 def _do_scatter():
                     idxs = tf.stack([b_idx, lin_idx], axis=1)
                     updates = tf.ones([m], dtype=tf.bool)
-                    return tf.scatter_nd(idxs, updates, [B, HW])
+                    if getattr(self.cfg, 'prefer_gpu_ops', True):
+                        return tf.scatter_nd(idxs, updates, [B, HW])
+                    with tf.device('/CPU:0'):
+                        return tf.scatter_nd(idxs, updates, [B, HW])
                 pos_points = tf.cond(m > 0, _do_scatter, lambda: pos_points)
                 pos_points = tf.stop_gradient(pos_points)
                 neg_mask_points = tf.logical_not(pos_points)

@@ -22,7 +22,8 @@ def parse_args():
     ap.add_argument("--val_steps", type=int, default=0, help="Optional cap on validation steps per epoch (0 = use full val set)")
     ap.add_argument("--cache", action="store_true", help="Cache training dataset in memory for speed (small datasets)")
     ap.add_argument("--tfrecord", type=str, default="", help="Optional path/glob to TFRecord files (overrides --data loader)")
-    ap.add_argument("--fast", action="store_true", help="Prefer GPU kernels for gather/top-k/scatter (faster, default)")
+    ap.add_argument("--fast", action="store_true", help="Prefer GPU kernels for gather/top-k/scatter (faster)")
+    ap.add_argument("--safe_cpu", action="store_true", help="Force CPU for gather/top-k/scatter (stability)")
     ap.add_argument("--debug_asserts", action="store_true", help="Enable runtime index assertions (slower)")
     return ap.parse_args()
 
@@ -101,8 +102,10 @@ def main():
     width_mult, depth_mult = scale_to_multipliers(args.model_scale)
     model = build_yolo11(num_classes=num_classes, width_mult=width_mult, depth_mult=depth_mult)
 
+    # prefer_gpu_ops defaults to True unless --safe_cpu is set
+    prefer_gpu_ops = not bool(getattr(args, 'safe_cpu', False))
     cfg = TrainConfig(num_classes=num_classes, img_size=args.imgsz, reg_max=16, lr=args.lr,
-                      prefer_gpu_ops=bool(args.fast or True), debug_asserts=bool(args.debug_asserts))
+                      prefer_gpu_ops=prefer_gpu_ops, debug_asserts=bool(args.debug_asserts))
     trainer = Trainer(model, cfg)
 
     # TensorBoard writer for charts (kept)
