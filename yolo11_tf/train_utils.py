@@ -51,26 +51,6 @@ class Trainer:
         with tf.device('/CPU:0'):
             return tf.math.top_k(values, k=k)
 
-    def _scatter_nd(self, indices, updates, shape):
-        """Scatter helper that keeps bool updates on CPU to avoid GPU kernel crashes.
-
-        TensorFlow's GPU `tf.scatter_nd` implementation for boolean tensors routes
-        through an `UnsortedSegment` kernel whose launch configuration can overflow
-        for typical detection head shapes (tens of thousands of elements). On recent
-        TF/CUDA stacks this manifests as a fatal
-        `gpu_launch_config.h:129 Check failed: work_element_count >= 0` abort during
-        training. Running the scatter on the CPU sidesteps the buggy GPU path while
-        keeping the behaviour identical for our small boolean masks. Numerical
-        tensors continue to honour the `prefer_gpu_ops` flag for performance.
-        """
-
-        prefer_gpu = getattr(self.cfg, 'prefer_gpu_ops', True)
-        # Force CPU for boolean updates even when prefer_gpu_ops is True.
-        if updates.dtype == tf.bool or not prefer_gpu:
-            with tf.device('/CPU:0'):
-                return tf.scatter_nd(indices, updates, shape)
-        return tf.scatter_nd(indices, updates, shape)
-
     @staticmethod
     def _assert_indices_in_range(idx: tf.Tensor, upper: tf.Tensor, name: str = "idx"):
         """Assert idx in [0, upper). Returns identity of idx with control deps.
@@ -425,38 +405,6 @@ class Trainer:
                 add_cls, add_obj = tf.cond(tf.shape(pos_pairs)[0] > 0, _cr_additions, _no_cr)
                 total_cls += add_cls
                 total_obj += add_obj
-
-                # Background negative classification sampling to teach background separation
-                # Build [B, HW] mask of positive points.
-                # Build mask of positives; stop gradient since it's used for sampling only
-                pos_points = tf.zeros([B, HW], dtype=tf.bool)
-                m = tf.shape(b_idx)[0]
-                def _do_scatter():
-                    idxs = tf.stack([b_idx, lin_idx], axis=1)
-                    updates = tf.ones([m], dtype=tf.bool)
-                    return self._scatter_nd(idxs, updates, [B, HW])
-                pos_points = tf.cond(m > 0, _do_scatter, lambda: pos_points)
-                pos_points = tf.stop_gradient(pos_points)
-                neg_mask_points = tf.logical_not(pos_points)
-                # Sample up to K negatives per image by top-k random scores over negatives
-                K = tf.minimum(HW, tf.constant(512, dtype=tf.int32))
-                rnd = tf.random.uniform([B, HW], dtype=tf.float32)
-                scores = tf.where(neg_mask_points, rnd, tf.fill([B, HW], -1.0))
-                res_neg = self._top_k(scores, k=K)
-                _, neg_idx = res_neg.values, res_neg.indices
-                if getattr(self.cfg, 'debug_asserts', False):
-                    _ = self._assert_indices_in_range(neg_idx, HW, name="neg_idx")
-                pred_neg_cls = self._gather_cpu(cls_map, neg_idx, batch_dims=1)  # [B, K, C]
-                zero_tgt = tf.zeros_like(pred_neg_cls)
-                neg_ce = bce_with_logits_loss(pred_neg_cls, zero_tgt)
-                neg_cls_loss = 0.25 * tf.reduce_mean(neg_ce)
-                total_cls += neg_cls_loss
-
-                # Objectness negatives
-                pred_neg_obj = self._gather_cpu(obj_map, neg_idx, batch_dims=1)  # [B,K,1]
-                zero_obj = tf.zeros_like(pred_neg_obj)
-                neg_obj_loss = 0.25 * tf.reduce_mean(bce_with_logits_loss(pred_neg_obj, zero_obj))
-                total_obj += neg_obj_loss
 
                 # Skip expensive full decode during training; evaluation runs its own decode
 
