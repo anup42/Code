@@ -20,6 +20,7 @@ def parse_args():
     ap.add_argument("--model_scale", type=str, default="n", choices=["n","s","m","l","x"])
     ap.add_argument("--lr", type=float, default=None)
     ap.add_argument("--out", type=str, default="runs/train_ultra/exp")
+    ap.add_argument("--resume", type=str, default="", help="Checkpoint path or directory to resume from ('auto' to use output dir)")
     ap.add_argument("--log_every", type=int, default=20, help="Print train metrics every N steps")
     ap.add_argument("--steps_per_epoch", type=int, default=0, help="Override steps per epoch; if >0, validate after N steps")
     ap.add_argument("--val_steps", type=int, default=0, help="Optional cap on validation steps per epoch (0 = full val)")
@@ -126,8 +127,34 @@ def main():
     )
     trainer = Trainer(model, train_cfg)
 
+    ckpt_dir = os.path.join(args.out, "ckpt")
+    ckpt_manager = tf.train.CheckpointManager(trainer.ckpt, ckpt_dir, max_to_keep=5)
+    initial_epoch = 0
+    resume_target = args.resume.strip()
+    if resume_target:
+        if resume_target.lower() == "auto":
+            resume_target = ckpt_dir
+        ckpt_path = None
+        if os.path.isdir(resume_target):
+            ckpt_path = tf.train.latest_checkpoint(resume_target)
+        elif tf.io.gfile.exists(resume_target):
+            ckpt_path = resume_target
+        if ckpt_path:
+            trainer.restore(ckpt_path)
+            initial_epoch = trainer.current_epoch()
+            print(
+                f"Resumed from {ckpt_path} at epoch {initial_epoch} (global_step={trainer.global_step_value()})",
+                flush=True,
+            )
+        else:
+            print(f"No checkpoint found at {resume_target}, starting fresh", flush=True)
+
+    if initial_epoch >= epochs:
+        print(f"Checkpoint already completed {initial_epoch} epochs (>= {epochs}). Nothing to do.", flush=True)
+        return
+
     # Simple training loop
-    for epoch in range(epochs):
+    for epoch in range(initial_epoch, epochs):
         print(f"Epoch {epoch+1}/{epochs}")
         t0 = time.time()
         seen = 0
@@ -158,6 +185,11 @@ def main():
             flush=True,
         )
         print(f"Epoch {epoch+1}/{epochs} — loss={metrics['loss']:.2f}  P={p:.4f} R={r:.4f} mAP50={m:.4f}")
+
+        trainer.assign_epoch(epoch + 1)
+        save_path = ckpt_manager.save(checkpoint_number=epoch + 1)
+        if save_path:
+            print(f"Saved checkpoint: {save_path}", flush=True)
 
 
 if __name__ == "__main__":

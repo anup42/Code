@@ -31,6 +31,36 @@ class Trainer:
         self.model = model
         self.cfg = cfg
         self.optimizer = tf.keras.optimizers.Adam(learning_rate=cfg.lr)
+        # Training state for checkpointing/resume support
+        self._epoch = tf.Variable(0, dtype=tf.int32, trainable=False, name="epoch")
+        self._global_step = tf.Variable(0, dtype=tf.int64, trainable=False, name="global_step")
+        self.ckpt = tf.train.Checkpoint(
+            model=self.model,
+            optimizer=self.optimizer,
+            epoch=self._epoch,
+            global_step=self._global_step,
+        )
+
+    def assign_epoch(self, epoch: int):
+        """Update the stored epoch counter (number of completed epochs)."""
+        self._epoch.assign(int(epoch))
+
+    def current_epoch(self) -> int:
+        """Return the stored epoch counter as a Python int."""
+        return int(self._epoch.numpy())
+
+    def global_step_value(self) -> int:
+        """Return the global step counter as a Python int."""
+        return int(self._global_step.numpy())
+
+    def restore(self, checkpoint_path: str, expect_partial: bool = True):
+        """Restore model/optimizer state from a checkpoint file."""
+        status = self.ckpt.restore(checkpoint_path)
+        if expect_partial:
+            status.expect_partial()
+        else:
+            status.assert_existing_objects_matched()
+        return status
 
     def _gather_cpu(self, x, indices, batch_dims=0):
         if getattr(self.cfg, 'prefer_gpu_ops', True):
@@ -441,6 +471,7 @@ class Trainer:
 
         grads = tape.gradient(loss, self.model.trainable_variables)
         self.optimizer.apply_gradients(zip(grads, self.model.trainable_variables))
+        self._global_step.assign_add(1)
 
         return {
             "loss": tf.cast(loss, tf.float32),
