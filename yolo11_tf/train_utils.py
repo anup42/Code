@@ -44,6 +44,28 @@ class Trainer:
         with tf.device('/CPU:0'):
             return tf.gather_nd(x, indices)
 
+    def _gather_hw(self, tensor, batch_indices, hw_indices, name="hw_idx"):
+        """Gather values from [B, HW, ...] tensors using per-element batch/HW indices.
+
+        This avoids two-step gathers (first by batch then by HW) whose gradients can
+        trigger very large `UnsortedSegment` launches on GPU. The combined gather_nd
+        keeps the inner dimension small, preventing overflow in the CUDA kernel.
+        """
+        batch_indices = tf.cast(batch_indices, tf.int32)
+        hw_indices = tf.cast(hw_indices, tf.int32)
+        if getattr(self.cfg, 'debug_asserts', False):
+            batch_indices = self._assert_indices_in_range(
+                batch_indices, tf.shape(tensor)[0], name=f"{name}_batch"
+            )
+            hw_indices = self._assert_indices_in_range(
+                hw_indices, tf.shape(tensor)[1], name=name
+            )
+        gather_idx = tf.stack([batch_indices, hw_indices], axis=1)
+        if getattr(self.cfg, 'prefer_gpu_ops', True):
+            return tf.gather_nd(tensor, gather_idx)
+        with tf.device('/CPU:0'):
+            return tf.gather_nd(tensor, gather_idx)
+
     def _top_k(self, values, k):
         """Top-k with optional CPU placement for stability when prefer_gpu_ops=False."""
         if getattr(self.cfg, 'prefer_gpu_ops', True):
@@ -248,28 +270,26 @@ class Trainer:
 
                 # For classification: build targets per location (one-hot per GT) squeezed onto unique indices.
                 # Simpler: compute classification loss only at positive gt selections.
-                b_idx, g_idx = tf.where(mask)[:, 0], tf.where(mask)[:, 1]
-                b_idx = tf.cast(b_idx, tf.int32)
-                g_idx = tf.cast(g_idx, tf.int32)
+                pos_coords = tf.where(mask)
+                pos_coords = tf.cast(pos_coords, tf.int32)
                 lin_idx = tf.zeros([0], dtype=tf.int32)
-                if tf.shape(b_idx)[0] > 0:
-                    # Compute linear indices on CPU for stability
-                    lin_idx = tf.gather_nd(idx, tf.stack([b_idx, g_idx], axis=1))  # [M]
+                if tf.shape(pos_coords)[0] > 0:
+                    b_idx = pos_coords[:, 0]
+                    g_idx = pos_coords[:, 1]
+                    lin_idx = tf.gather_nd(idx, pos_coords)  # [M]
                     if getattr(self.cfg, 'debug_asserts', False):
                         lin_idx = self._assert_indices_in_range(lin_idx, HW, name="lin_idx")
-                    pred_cls_sel = self._gather_cpu(cls_map, b_idx)
-                    pred_cls_sel = self._gather_cpu(pred_cls_sel, lin_idx, batch_dims=1)  # [M, C]
+                    pred_cls_sel = self._gather_hw(cls_map, b_idx, lin_idx, name="lin_idx")  # [M, C]
 
-                    tgt_cls = self._gather_nd_cpu(pos_targs[si]["cls"], tf.stack([b_idx, g_idx], axis=1))  # [M, C]
+                    tgt_cls = self._gather_nd_cpu(pos_targs[si]["cls"], pos_coords)  # [M, C]
                     cls_loss = tf.reduce_sum(bce_with_logits_loss(pred_cls_sel, tgt_cls)) / num_pos
                     total_cls += cls_loss
 
                     # Regression and DFL on positives
-                    pred_reg_sel = self._gather_cpu(reg_map, b_idx)
-                    pred_reg_sel = self._gather_cpu(pred_reg_sel, lin_idx, batch_dims=1)  # [M, 4*(R)]
+                    pred_reg_sel = self._gather_hw(reg_map, b_idx, lin_idx, name="lin_idx")  # [M, 4*(R)]
                     bins = self.cfg.reg_max + 1
                     pred_reg_sel = tf.reshape(pred_reg_sel, [-1, 4, bins])
-                    tgt_ltrb = tf.gather_nd(pos_targs[si]["ltrb"], tf.stack([b_idx, g_idx], axis=1))  # [M, 4]
+                    tgt_ltrb = tf.gather_nd(pos_targs[si]["ltrb"], pos_coords)  # [M, 4]
                     dfl = dfl_loss(pred_reg_sel, tgt_ltrb, self.cfg.reg_max)
                     total_dfl += dfl
 
@@ -294,8 +314,7 @@ class Trainer:
                     total_box += box_loss
 
                     # Objectness on positives
-                    pred_obj_pos = self._gather_cpu(obj_map, b_idx)
-                    pred_obj_pos = self._gather_cpu(pred_obj_pos, lin_idx, batch_dims=1)  # [M,1]
+                    pred_obj_pos = self._gather_hw(obj_map, b_idx, lin_idx, name="lin_idx")  # [M,1]
                     obj_pos_tgt = tf.ones_like(pred_obj_pos)
                     obj_pos_loss = tf.reduce_mean(bce_with_logits_loss(pred_obj_pos, obj_pos_tgt))
                     total_obj += obj_pos_loss
@@ -343,9 +362,12 @@ class Trainer:
                     cls_oh_pos = tf.one_hot(cls_ids_pos, depth=C)
                     # Predicted boxes for selected points (DFL decode)
                     bins = self.cfg.reg_max + 1
-                    n_pos = self._assert_indices_in_range(n_pos, HW, name="n_pos")
-                    pred_reg_pts = self._gather_cpu(reg_map, b_pos)
-                    pred_reg_pts = self._gather_cpu(pred_reg_pts, n_pos, batch_dims=1)  # [M, 4*(R)]
+                    if getattr(self.cfg, 'debug_asserts', False):
+                        n_pos = self._assert_indices_in_range(n_pos, HW, name="n_pos")
+                        b_pos_checked = self._assert_indices_in_range(b_pos, tf.shape(cls_map)[0], name="b_pos")
+                    else:
+                        b_pos_checked = b_pos
+                    pred_reg_pts = self._gather_hw(reg_map, b_pos_checked, n_pos, name="n_pos")  # [M, 4*(R)]
                     pred_reg_pts = tf.reshape(pred_reg_pts, [-1, 4, bins])
                     dist_bins = integral_distribution(pred_reg_pts, self.cfg.reg_max) * stride  # [M,4]
                     pxy = tf.gather(pts, n_pos)  # [M,2] (no gradient to model outputs)
@@ -388,13 +410,14 @@ class Trainer:
                     top_vals, top_idx = tf.cond(M > 0, _do_topk, _empty)
                     i_sel = top_idx
                     w = top_vals
-                    pred_cls_pts = self._gather_cpu(self._gather_cpu(cls_map, b_pos), i_sel, batch_dims=0)
-                    n_pos_sel = tf.gather(n_pos, i_sel)
-                    n_pos_sel = self._assert_indices_in_range(n_pos_sel, HW, name="n_pos_sel")
-                    pred_cls_pts = self._gather_cpu(pred_cls_pts, n_pos_sel, batch_dims=1)
+                    b_sel = self._gather_cpu(b_pos_checked, i_sel)
+                    n_pos_sel = self._gather_cpu(n_pos, i_sel)
+                    if getattr(self.cfg, 'debug_asserts', False):
+                        n_pos_sel = self._assert_indices_in_range(n_pos_sel, HW, name="n_pos_sel")
+                        b_sel = self._assert_indices_in_range(b_sel, tf.shape(cls_map)[0], name="b_pos_sel")
+                    pred_cls_pts = self._gather_hw(cls_map, b_sel, n_pos_sel, name="cr_idx")
+                    pred_obj_pts = self._gather_hw(obj_map, b_sel, n_pos_sel, name="cr_idx")
                     cls_oh_sel = tf.gather(cls_oh_pos, i_sel)
-                    pred_obj_pts = self._gather_cpu(self._gather_cpu(obj_map, b_pos), i_sel, batch_dims=0)
-                    pred_obj_pts = self._gather_cpu(pred_obj_pts, n_pos_sel, batch_dims=1)
                     cls_loss_pts = bce_with_logits_loss(pred_cls_pts, cls_oh_sel)
                     cls_loss_pts = tf.reduce_sum(cls_loss_pts * tf.where(tf.size(w) > 0, w[:, None], tf.zeros_like(cls_loss_pts))) / (tf.reduce_sum(w) + 1e-9)
                     obj_pos_loss2 = tf.reduce_sum(bce_with_logits_loss(pred_obj_pts, tf.ones_like(pred_obj_pts)) * tf.where(tf.size(w) > 0, w[:, None], tf.zeros_like(pred_obj_pts))) / (tf.reduce_sum(w) + 1e-9)
