@@ -170,153 +170,131 @@ def decode_maps_to_dets_np(pred, conf_thres=0.25, iou_thres=0.5, max_det=300, im
     return outs
 
 
-def compute_pr_map50(dets_by_img: List[np.ndarray], gts_by_img: List[np.ndarray], num_classes: int, iou_thres=0.5):
-    tp_scores = {c: [] for c in range(num_classes)}
-    fp_scores = {c: [] for c in range(num_classes)}
-    npos = {c: 0 for c in range(num_classes)}
+def _compute_ap_curve(recall: np.ndarray, precision: np.ndarray) -> float:
+    if recall.size == 0 or precision.size == 0:
+        return 0.0
+    mrec = np.concatenate(([0.0], recall, [1.0]))
+    mpre = np.concatenate(([0.0], precision, [0.0]))
+    for i in range(mpre.size - 1, 0, -1):
+        mpre[i - 1] = np.maximum(mpre[i - 1], mpre[i])
+    idx = np.where(mrec[1:] != mrec[:-1])[0]
+    return float(np.sum((mrec[idx + 1] - mrec[idx]) * mpre[idx + 1]))
 
+
+def _gather_image_stats(dets: np.ndarray, gts: np.ndarray, num_classes: int, iou_thresholds: np.ndarray):
+    num_iou = iou_thresholds.size
+    if dets.size == 0:
+        tp = np.zeros((0, num_iou), dtype=bool)
+        conf = np.zeros((0,), dtype=np.float32)
+        pred_cls = np.zeros((0,), dtype=np.int32)
+    else:
+        boxes = dets[:, 0:4].astype(np.float32)
+        conf = dets[:, 4].astype(np.float32)
+        pred_cls = dets[:, 5].astype(np.int32)
+        if num_classes > 0:
+            pred_cls = np.clip(pred_cls, 0, num_classes - 1)
+        tp = np.zeros((boxes.shape[0], num_iou), dtype=bool)
+        order = np.argsort(-conf)
+        if gts.size > 0:
+            gt_cls = gts[:, 0].astype(np.int32)
+            gt_boxes = _xywhn_to_xyxy_np(gts[:, 1:5])
+            ious = _bbox_iou_np(boxes, gt_boxes)
+            matched = np.zeros((num_iou, gt_boxes.shape[0]), dtype=bool)
+            for det_idx in order:
+                cls = pred_cls[det_idx]
+                gt_mask = np.where(gt_cls == cls)[0]
+                if gt_mask.size == 0:
+                    continue
+                ious_cls = ious[det_idx, gt_mask]
+                best_rel = int(np.argmax(ious_cls))
+                best_gt = gt_mask[best_rel]
+                best_iou = ious_cls[best_rel]
+                for thr_idx, thr in enumerate(iou_thresholds):
+                    if best_iou >= thr and not matched[thr_idx, best_gt]:
+                        matched[thr_idx, best_gt] = True
+                        tp[det_idx, thr_idx] = True
+        tp = tp[order]
+        conf = conf[order]
+        pred_cls = pred_cls[order]
+    target_cls = gts[:, 0].astype(np.int32) if gts.size > 0 else np.zeros((0,), dtype=np.int32)
+    return tp, conf, pred_cls, target_cls
+
+
+def _accumulate_stats(dets_by_img: List[np.ndarray], gts_by_img: List[np.ndarray], num_classes: int, iou_thresholds: np.ndarray):
+    tp_list = []
+    conf_list = []
+    pred_cls_list = []
+    target_cls_list = []
     for g, d in zip(gts_by_img, dets_by_img):
-        if g.size > 0:
-            g_cls = g[:, 0].astype(np.int32)
-            g_xyxy = _xywhn_to_xyxy_np(g[:, 1:5])
-        else:
-            g_cls = np.zeros((0,), dtype=np.int32)
-            g_xyxy = np.zeros((0, 4), dtype=np.float32)
-        if d.size > 0:
-            d_xyxy = d[:, 0:4]
-            d_scores = d[:, 4]
-            d_cls = d[:, 5].astype(np.int32)
-        else:
-            d_xyxy = np.zeros((0, 4), dtype=np.float32)
-            d_scores = np.zeros((0,), dtype=np.float32)
-            d_cls = np.zeros((0,), dtype=np.int32)
+        tp, conf, pred_cls, target_cls = _gather_image_stats(d, g, num_classes, iou_thresholds)
+        tp_list.append(tp)
+        conf_list.append(conf)
+        pred_cls_list.append(pred_cls)
+        target_cls_list.append(target_cls)
 
-        for c in range(num_classes):
-            gt_idx = np.where(g_cls == c)[0]
-            det_idx = np.where(d_cls == c)[0]
-            npos[c] += gt_idx.size
-            if det_idx.size == 0:
-                continue
-            det_order = det_idx[np.argsort(-d_scores[det_idx])]
-            matched = np.zeros(gt_idx.size, dtype=bool)
-            for di in det_order:
-                if gt_idx.size == 0:
-                    fp_scores[c].append(d_scores[di])
-                    continue
-                ious = _bbox_iou_np(d_xyxy[di:di+1], g_xyxy[gt_idx])[0]
-                best = np.argmax(ious)
-                if ious[best] >= iou_thres and not matched[best]:
-                    matched[best] = True
-                    tp_scores[c].append(d_scores[di])
-                else:
-                    fp_scores[c].append(d_scores[di])
+    tp_all = np.concatenate(tp_list, axis=0) if tp_list else np.zeros((0, iou_thresholds.size), dtype=bool)
+    conf_all = np.concatenate(conf_list, axis=0) if conf_list else np.zeros((0,), dtype=np.float32)
+    pred_cls_all = np.concatenate(pred_cls_list, axis=0) if pred_cls_list else np.zeros((0,), dtype=np.int32)
+    target_cls_all = np.concatenate(target_cls_list, axis=0) if target_cls_list else np.zeros((0,), dtype=np.int32)
+    return tp_all, conf_all, pred_cls_all, target_cls_all
 
-    ap_list = []
-    total_tp = 0
-    total_fp = 0
-    total_pos = 0
+
+def _compute_precision_recall_ap(tp: np.ndarray, conf: np.ndarray, pred_cls: np.ndarray,
+                                 target_cls: np.ndarray, num_classes: int, iou_thresholds: np.ndarray):
+    num_iou = iou_thresholds.size
+    ap = np.zeros((num_classes, num_iou), dtype=np.float32)
+    class_counts = np.bincount(target_cls, minlength=num_classes).astype(np.int32) if num_classes > 0 else np.zeros((0,), dtype=np.int32)
+
+    if tp.size:
+        tp50 = tp[:, 0].astype(np.float32)
+        total_tp = float(tp50.sum())
+        total_fp = float(tp.shape[0] - tp50.sum())
+    else:
+        tp50 = np.zeros((0,), dtype=np.float32)
+        total_tp = 0.0
+        total_fp = 0.0
+    total_det = total_tp + total_fp
+    precision_global = float(total_tp / (total_det + 1e-9)) if total_det > 0 else 0.0
+    recall_global = float(total_tp / (target_cls.size + 1e-9)) if target_cls.size > 0 else 0.0
+
     for c in range(num_classes):
-        pos = npos[c]
-        total_pos += pos
-        scores = np.array(tp_scores[c] + fp_scores[c], dtype=np.float32)
-        labels = np.array([1] * len(tp_scores[c]) + [0] * len(fp_scores[c]), dtype=np.int32)
-        if scores.size == 0:
-            ap_list.append(0.0)
+        cls_mask = pred_cls == c
+        n_gt = int(class_counts[c]) if c < class_counts.size else 0
+        if cls_mask.sum() == 0:
             continue
-        order = np.argsort(-scores)
-        labels = labels[order]
-        tp_cum = np.cumsum(labels)
-        fp_cum = np.cumsum(1 - labels)
-        total_tp += int(tp_cum[-1])
-        total_fp += int(fp_cum[-1])
-        if pos == 0:
-            ap_list.append(0.0)
+        tp_c = tp[cls_mask].astype(np.float32)
+        conf_c = conf[cls_mask].astype(np.float32)
+        order = np.argsort(-conf_c)
+        tp_c = tp_c[order]
+        fp_c = (1.0 - tp_c).cumsum(axis=0)
+        tp_cum = tp_c.cumsum(axis=0)
+        if n_gt > 0:
+            recall_curve = tp_cum / (n_gt + 1e-9)
+            precision_curve = tp_cum / (tp_cum + fp_c + 1e-9)
+            for j in range(num_iou):
+                ap[c, j] = _compute_ap_curve(recall_curve[:, j], precision_curve[:, j])
+        else:
+            # No GT for this class -> AP stays zero
             continue
-        recall = tp_cum / float(pos)
-        precision = tp_cum / np.maximum(tp_cum + fp_cum, 1e-9)
-        mrec = np.concatenate(([0.0], recall, [1.0]))
-        mpre = np.concatenate(([0.0], precision, [0.0]))
-        for i in range(mpre.size - 1, 0, -1):
-            mpre[i - 1] = np.maximum(mpre[i - 1], mpre[i])
-        idx = np.where(mrec[1:] != mrec[:-1])[0]
-        ap = np.sum((mrec[idx + 1] - mrec[idx]) * mpre[idx + 1])
-        ap_list.append(float(ap))
 
-    precision_global = total_tp / max(total_tp + total_fp, 1e-9)
-    recall_global = total_tp / max(total_pos, 1e-9)
-    map50 = float(np.mean(ap_list)) if len(ap_list) else 0.0
-    return float(precision_global), float(recall_global), map50
+    return precision_global, recall_global, ap, class_counts
 
 
-def compute_map_at_iou(dets_by_img: List[np.ndarray], gts_by_img: List[np.ndarray], num_classes: int, iou_thres=0.5):
-    """Compute mAP at a specific IoU threshold (COCO-style AP)."""
-    ap_list = []
-    for c in range(num_classes):
-        scores_c = []
-        labels_c = []
-        pos = 0
-        for g, d in zip(gts_by_img, dets_by_img):
-            if g.size > 0:
-                g_cls = g[:, 0].astype(np.int32)
-                g_xyxy = _xywhn_to_xyxy_np(g[:, 1:5])
-            else:
-                g_cls = np.zeros((0,), dtype=np.int32)
-                g_xyxy = np.zeros((0, 4), dtype=np.float32)
-            if d.size > 0:
-                d_xyxy = d[:, 0:4]
-                d_scores = d[:, 4]
-                d_cls = d[:, 5].astype(np.int32)
-            else:
-                d_xyxy = np.zeros((0, 4), dtype=np.float32)
-                d_scores = np.zeros((0,), dtype=np.float32)
-                d_cls = np.zeros((0,), dtype=np.int32)
-
-            gt_idx = np.where(g_cls == c)[0]
-            det_idx = np.where(d_cls == c)[0]
-            pos += gt_idx.size
-            if det_idx.size == 0:
-                continue
-            order = det_idx[np.argsort(-d_scores[det_idx])]
-            matched = np.zeros(gt_idx.size, dtype=bool)
-            for di in order:
-                if gt_idx.size == 0:
-                    scores_c.append(d_scores[di])
-                    labels_c.append(0)
-                    continue
-                ious = _bbox_iou_np(d_xyxy[di:di+1], g_xyxy[gt_idx])[0]
-                best = np.argmax(ious)
-                if ious[best] >= iou_thres and not matched[best]:
-                    matched[best] = True
-                    scores_c.append(d_scores[di])
-                    labels_c.append(1)
-                else:
-                    scores_c.append(d_scores[di])
-                    labels_c.append(0)
-        if len(scores_c) == 0 or pos == 0:
-            ap_list.append(0.0)
-            continue
-        scores = np.array(scores_c, dtype=np.float32)
-        labels = np.array(labels_c, dtype=np.int32)
-        order = np.argsort(-scores)
-        labels = labels[order]
-        tp_cum = np.cumsum(labels)
-        fp_cum = np.cumsum(1 - labels)
-        recall = tp_cum / float(pos)
-        precision = tp_cum / np.maximum(tp_cum + fp_cum, 1e-9)
-        mrec = np.concatenate(([0.0], recall, [1.0]))
-        mpre = np.concatenate(([0.0], precision, [0.0]))
-        for i in range(mpre.size - 1, 0, -1):
-            mpre[i - 1] = np.maximum(mpre[i - 1], mpre[i])
-        idx = np.where(mrec[1:] != mrec[:-1])[0]
-        ap = np.sum((mrec[idx + 1] - mrec[idx]) * mpre[idx + 1])
-        ap_list.append(float(ap))
-    return float(np.mean(ap_list)) if len(ap_list) else 0.0
+def compute_pr_map50(dets_by_img: List[np.ndarray], gts_by_img: List[np.ndarray], num_classes: int, iou_thres=0.5):
+    iou_thresholds = np.array([iou_thres], dtype=np.float32)
+    tp, conf, pred_cls, target_cls = _accumulate_stats(dets_by_img, gts_by_img, num_classes, iou_thresholds)
+    precision, recall, ap, class_counts = _compute_precision_recall_ap(tp, conf, pred_cls, target_cls, num_classes, iou_thresholds)
+    valid = class_counts > 0
+    map50 = float(ap[valid, 0].mean()) if valid.any() else 0.0
+    return precision, recall, map50
 
 
 def compute_map50_95(dets_by_img: List[np.ndarray], gts_by_img: List[np.ndarray], num_classes: int):
-    ious = [0.5 + 0.05 * i for i in range(10)]
-    aps = [compute_map_at_iou(dets_by_img, gts_by_img, num_classes, iou) for iou in ious]
-    return float(np.mean(aps))
+    iou_thresholds = np.linspace(0.5, 0.95, 10, dtype=np.float32)
+    tp, conf, pred_cls, target_cls = _accumulate_stats(dets_by_img, gts_by_img, num_classes, iou_thresholds)
+    _, _, ap, class_counts = _compute_precision_recall_ap(tp, conf, pred_cls, target_cls, num_classes, iou_thresholds)
+    valid = class_counts > 0
+    return float(ap[valid].mean()) if valid.any() else 0.0
 
 
 def evaluate_dataset_pr_maps(model: tf.keras.Model, val_ds, num_classes: int,
@@ -359,9 +337,13 @@ def evaluate_dataset_pr_maps(model: tf.keras.Model, val_ds, num_classes: int,
                 gts_all.append(np.concatenate([cls, cx, cy, w, h], axis=1))
                 dets_all.append(dets[i])
 
-    p, r, map50 = compute_pr_map50(dets_all, gts_all, num_classes, iou_thres=0.5)
-    map5095 = compute_map50_95(dets_all, gts_all, num_classes)
-    return p, r, map50, map5095
+    iou_thresholds = np.linspace(0.5, 0.95, 10, dtype=np.float32)
+    tp, conf, pred_cls, target_cls = _accumulate_stats(dets_all, gts_all, num_classes, iou_thresholds)
+    precision, recall, ap, class_counts = _compute_precision_recall_ap(tp, conf, pred_cls, target_cls, num_classes, iou_thresholds)
+    valid = class_counts > 0
+    map50 = float(ap[valid, 0].mean()) if valid.any() else 0.0
+    map5095 = float(ap[valid].mean()) if valid.any() else 0.0
+    return precision, recall, map50, map5095
 
 
 def evaluate_dataset_pr_maps_fast(model: tf.keras.Model, val_ds, num_classes: int,
@@ -371,7 +353,6 @@ def evaluate_dataset_pr_maps_fast(model: tf.keras.Model, val_ds, num_classes: in
 
     If progbar is provided (e.g., tf.keras.utils.Progbar), updates it each batch up to total_steps.
     """
-    assert imgsz is not None, "imgsz is required for normalization in fast evaluation"
     infer = YoloInferencer(model, score_thresh=conf_thres, iou_thresh=iou_thres)
 
     dets_all: List[np.ndarray] = []
@@ -385,7 +366,7 @@ def evaluate_dataset_pr_maps_fast(model: tf.keras.Model, val_ds, num_classes: in
             B = images.shape[0]
             for i in range(B):
                 n = int(valid[i].numpy())
-                bi = boxes[i][:n].numpy() / float(imgsz)
+                bi = boxes[i][:n].numpy()
                 si = scores[i][:n].numpy()
                 ci = classes[i][:n].numpy().astype(np.float32)
                 if n > 0:
@@ -404,7 +385,7 @@ def evaluate_dataset_pr_maps_fast(model: tf.keras.Model, val_ds, num_classes: in
             H, W = images.shape[1], images.shape[2]
             for i in range(B):
                 n = int(valid[i].numpy())
-                bi = boxes[i][:n].numpy() / float(imgsz)
+                bi = boxes[i][:n].numpy()
                 si = scores[i][:n].numpy()
                 ci = classes[i][:n].numpy().astype(np.float32)
                 if n > 0:
@@ -430,9 +411,13 @@ def evaluate_dataset_pr_maps_fast(model: tf.keras.Model, val_ds, num_classes: in
         if progbar is not None and total_steps is not None:
             progbar.update(min(step, total_steps))
 
-    p, r, map50 = compute_pr_map50(dets_all, gts_all, num_classes, iou_thres=0.5)
-    map5095 = compute_map50_95(dets_all, gts_all, num_classes)
-    return p, r, map50, map5095
+    iou_thresholds = np.linspace(0.5, 0.95, 10, dtype=np.float32)
+    tp, conf, pred_cls, target_cls = _accumulate_stats(dets_all, gts_all, num_classes, iou_thresholds)
+    precision, recall, ap, class_counts = _compute_precision_recall_ap(tp, conf, pred_cls, target_cls, num_classes, iou_thresholds)
+    valid = class_counts > 0
+    map50 = float(ap[valid, 0].mean()) if valid.any() else 0.0
+    map5095 = float(ap[valid].mean()) if valid.any() else 0.0
+    return precision, recall, map50, map5095
 
 
 def evaluate_dataset_map50(model: tf.keras.Model, val_ds, num_classes: int,
