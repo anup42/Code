@@ -672,18 +672,19 @@ def _serialize_example(img_path: str):
     """Read an image path + its YOLO label file and return serialized TF Example.
 
     Stores:
-      - image: bytes (raw RGB array, already decoded)
+      - image: bytes (encoded original image)
       - shape: int64[2] (h, w)
       - labels: float32 list (flattened [N,5] rows [cls,cx,cy,w,h])
     """
+    from io import BytesIO
     from PIL import Image  # light dependency, commonly available; avoids cv2 requirement
 
     p = img_path
-    with Image.open(p) as im:
+    with open(p, 'rb') as f:
+        img_bytes = f.read()
+    with Image.open(BytesIO(img_bytes)) as im:
         im = im.convert("RGB")
-        img_arr = np.ascontiguousarray(im, dtype=np.uint8)
-    h, w = img_arr.shape[0], img_arr.shape[1]
-    img_bytes = img_arr.tobytes()
+        w, h = im.size
 
     labels = read_label_file(img2label_path(p)).astype(np.float32)
     labels_flat = labels.reshape(-1).astype(np.float32)
@@ -810,12 +811,10 @@ def build_trainer_dataset_from_tfrecord(tfrec_glob: str, imgsz=640, batch_size=1
 
     def _parse(rec):
         ex = tf.io.parse_single_example(rec, feature_spec)
+        img = tf.image.decode_image(ex['image'], channels=3, expand_animations=False)
+        img = tf.cast(img, tf.float32)
         h0 = tf.cast(ex['shape'][0], tf.int32)
         w0 = tf.cast(ex['shape'][1], tf.int32)
-        img = tf.io.decode_raw(ex['image'], tf.uint8)
-        img = tf.reshape(img, tf.stack([h0, w0, 3]))
-        img.set_shape([None, None, 3])
-        img = tf.cast(img, tf.float32)
         labels = tf.sparse.to_dense(ex['labels'])
         labels = tf.reshape(labels, [-1, 5])  # [N,5]
         # Letterbox
