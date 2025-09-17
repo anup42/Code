@@ -5,7 +5,7 @@ import tensorflow as tf
 from yolo11_tf.model import build_yolo11
 from yolo11_tf.data import build_trainer_dataset
 from yolo11_tf.train_utils import Trainer, TrainConfig
-from yolo11_tf.metrics import evaluate_dataset_pr_maps, evaluate_dataset_pr_maps_fast
+from yolo11_tf.metrics import evaluate_dataset_pr_maps_fast
 
 
 def parse_args():
@@ -43,6 +43,10 @@ def scale_to_multipliers(scale: str):
 def main():
     args = parse_args()
     os.makedirs(args.out, exist_ok=True)
+
+    print("=== Training arguments ===", flush=True)
+    for k in sorted(vars(args)):
+        print(f"  {k}: {getattr(args, k)}", flush=True)
 
     # Enable GPU memory growth to avoid full allocation
     try:
@@ -100,6 +104,12 @@ def main():
     opt.deterministic = False
     train_ds = train_ds.with_options(opt)
 
+    print("=== Dataset summary ===", flush=True)
+    print(f"  train_images: {len(train_files)}", flush=True)
+    print(f"  val_images: {len(val_files)}", flush=True)
+    print(f"  steps_per_epoch: {steps_per_epoch}", flush=True)
+    print(f"  steps_per_val: {steps_per_val}", flush=True)
+
     width_mult, depth_mult = scale_to_multipliers(args.model_scale)
     model = build_yolo11(num_classes=num_classes, width_mult=width_mult, depth_mult=depth_mult)
 
@@ -109,14 +119,41 @@ def main():
                       prefer_gpu_ops=prefer_gpu_ops, debug_asserts=bool(args.debug_asserts))
     trainer = Trainer(model, cfg)
 
+    print("=== Derived configuration ===", flush=True)
+    print(f"  width_mult: {width_mult}", flush=True)
+    print(f"  depth_mult: {depth_mult}", flush=True)
+    print(f"  train_config: {cfg}", flush=True)
+
     # Checkpoint manager for saving/resuming
     ckpt_dir = os.path.join(args.out, "ckpt")
     ckpt_manager = tf.train.CheckpointManager(trainer.ckpt, ckpt_dir, max_to_keep=5)
+    tb_dir = os.path.join(args.out, "tb")
+    best_val_loss_path = os.path.join(args.out, "best_val_loss.txt")
+
+    print("=== Output locations ===", flush=True)
+    print(f"  run_dir: {os.path.abspath(args.out)}", flush=True)
+    print(f"  checkpoints: {os.path.abspath(ckpt_dir)}", flush=True)
+    print(f"  tensorboard: {os.path.abspath(tb_dir)}", flush=True)
+    print(f"  best_val_loss_file: {os.path.abspath(best_val_loss_path)}", flush=True)
+
     initial_epoch = 0
     resume_target = args.resume.strip()
+    best_val_loss = float('inf')
+    if resume_target and os.path.exists(best_val_loss_path):
+        try:
+            with open(best_val_loss_path, 'r', encoding='utf-8') as f:
+                best_val_loss = float(f.readline().strip())
+            print(f"Loaded previous best validation loss {best_val_loss:.6f} from {best_val_loss_path}", flush=True)
+        except Exception as e:
+            print(f"Warning: failed to read best validation loss from {best_val_loss_path}: {e}", flush=True)
+    elif os.path.exists(best_val_loss_path) and not resume_target:
+        print("Existing best validation loss file found but resume was not requested; a new best will overwrite it.", flush=True)
+
     if resume_target:
+        print(f"Resume requested with target '{resume_target}'", flush=True)
         if resume_target.lower() == "auto":
             resume_target = ckpt_dir
+            print(f"Resolved automatic resume target to {resume_target}", flush=True)
         ckpt_path = None
         if os.path.isdir(resume_target):
             ckpt_path = tf.train.latest_checkpoint(resume_target)
@@ -129,15 +166,18 @@ def main():
                 f"Resumed from {ckpt_path} at epoch {initial_epoch} (global_step={trainer.global_step_value()})",
                 flush=True,
             )
+            if best_val_loss == float('inf'):
+                print("Best validation loss value unknown; checkpoints will save on first improvement.", flush=True)
         else:
             print(f"No checkpoint found at {resume_target}, starting fresh", flush=True)
+    else:
+        print("No --resume path provided; starting training from scratch.", flush=True)
 
     if initial_epoch >= args.epochs:
         print(f"Checkpoint already completed {initial_epoch} epochs (>= {args.epochs}). Nothing to do.", flush=True)
         return
 
     # TensorBoard writer for charts (kept)
-    tb_dir = os.path.join(args.out, "tb")
     writer = tf.summary.create_file_writer(tb_dir)
 
     for epoch in range(initial_epoch, args.epochs):
@@ -161,6 +201,16 @@ def main():
         print("Validating...")
         pb_val = tf.keras.utils.Progbar(steps_per_val, stateful_metrics=["p","r","mAP50","mAP50-95"], unit_name="val")
         # Optionally limit val_ds to args.val_steps using take()
+        val_loss_iter = val_ds.take(steps_per_val) if steps_per_val else val_ds
+        val_loss_totals = {key: 0.0 for key in ("loss", "cls", "box", "dfl", "obj", "pos")}
+        val_batches = 0
+        for v_images, v_targets in val_loss_iter:
+            val_metrics = trainer.validation_step(v_images, v_targets)
+            val_batches += 1
+            for key in val_loss_totals:
+                val_loss_totals[key] += float(val_metrics[key].numpy())
+        avg_val_loss = val_loss_totals['loss'] / max(1, val_batches)
+
         val_iter = val_ds.take(steps_per_val) if steps_per_val else val_ds
         p, r, m50, m5095 = evaluate_dataset_pr_maps_fast(
             model, val_iter, num_classes, conf_thres=0.001, iou_thres=0.5, max_det=300, imgsz=args.imgsz,
@@ -170,7 +220,8 @@ def main():
         ips = (seen / dt) if dt > 0 else 0.0
         print(
             f"Epoch {epoch+1}/{args.epochs} done in {dt:.1f}s ({ips:.1f} img/s) - "
-            f"last_loss={metrics['loss']:.3f}  P={p:.4f} R={r:.4f} mAP50={m50:.4f} mAP50-95={m5095:.4f}",
+            f"last_loss={metrics['loss']:.3f}  val_loss={avg_val_loss:.4f}  "
+            f"P={p:.4f} R={r:.4f} mAP50={m50:.4f} mAP50-95={m5095:.4f}",
             flush=True,
         )
         # Log to TensorBoard for charts
@@ -180,13 +231,31 @@ def main():
             tf.summary.scalar('metrics/mAP50', m50, step=epoch)
             tf.summary.scalar('metrics/mAP50_95', m5095, step=epoch)
             tf.summary.scalar('loss/train', metrics['loss'], step=epoch)
+            tf.summary.scalar('loss/val', avg_val_loss, step=epoch)
             writer.flush()
 
         # Save checkpoint with epoch counter advanced
         trainer.assign_epoch(epoch + 1)
-        save_path = ckpt_manager.save(checkpoint_number=epoch + 1)
-        if save_path:
-            print(f"Saved checkpoint: {save_path}", flush=True)
+        prev_best = best_val_loss
+        if avg_val_loss < best_val_loss:
+            best_val_loss = avg_val_loss
+            try:
+                with open(best_val_loss_path, 'w', encoding='utf-8') as f:
+                    f.write(f"{best_val_loss:.6f}\n")
+            except Exception as e:
+                print(f"Warning: failed to write best validation loss to {best_val_loss_path}: {e}", flush=True)
+            save_path = ckpt_manager.save(checkpoint_number=epoch + 1)
+            if save_path:
+                print(
+                    f"Validation loss improved from {prev_best if prev_best != float('inf') else 'inf'} to {best_val_loss:.6f}. "
+                    f"Saved checkpoint: {save_path}",
+                    flush=True,
+                )
+        else:
+            print(
+                f"Validation loss did not improve (current {avg_val_loss:.6f} >= best {best_val_loss:.6f}). Skipping checkpoint save.",
+                flush=True,
+            )
 
 
 if __name__ == "__main__":
