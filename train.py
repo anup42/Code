@@ -220,7 +220,13 @@ def main():
         val_loss_iter = val_ds.take(steps_per_val) if steps_per_val else val_ds
         val_loss_totals = {key: 0.0 for key in ("loss", "cls", "box", "dfl", "obj", "pos")}
         val_batches = 0
-        for v_images, v_targets in val_loss_iter:
+        for batch in val_loss_iter:
+            try:
+                v_images, v_targets = trainer.extract_images_targets(batch)
+            except ValueError as e:
+                raise ValueError(
+                    "Validation dataset element does not provide (images, targets)"
+                ) from e
             val_metrics = trainer.validation_step(v_images, v_targets)
             val_batches += 1
             for key in val_loss_totals:
