@@ -56,14 +56,19 @@ def build_neck(feat_channels, width_mult=0.50, depth_mult=0.33):
     p3_l = ConvBnSiLU(ch(128), 1, 1)(p3)
     p3_out = C2f(ch(128), n(3))(L.Concatenate(axis=-1)([p3_l, p4_up]))
 
-    # Bottom-up
+    # Bottom-up path produces strides {8, 16}
     p3_dn = ConvBnSiLU(ch(128), 3, 2)(p3_out)
     p4_out = C2f(ch(256), n(3))(L.Concatenate(axis=-1)([p3_dn, p4_td]))
 
     p4_dn = ConvBnSiLU(ch(256), 3, 2)(p4_out)
     p5_out = C2f(ch(256), n(3))(L.Concatenate(axis=-1)([p4_dn, p5_td]))
 
-    return keras.Model([p3, p4, p5], [p3_out, p4_out, p5_out], name="neck")
+    # Additional downsample head for stride 32 outputs (large objects)
+    p5_dn = ConvBnSiLU(ch(256), 3, 2)(p5_out)
+    p6_out = C2f(ch(256), n(3))(p5_dn)
+
+    # Return only strides (8,16,32) for detection head
+    return keras.Model([p3, p4, p5], [p4_out, p5_out, p6_out], name="neck")
 
 
 class DetectHeadDFL(keras.Model):
@@ -73,7 +78,7 @@ class DetectHeadDFL(keras.Model):
       - 'cls': list of [B, HW, C]
       - 'reg': list of [B, HW, 4*(bins)]
       - 'grids': list of [HW, 2] (pixel centers)
-      - 'strides': list of ints [8,16,32]
+      - 'strides': list of ints in image pixels (e.g. 8, 16, 32)
     """
 
     def __init__(self, num_classes, ch=(256, 256, 256), reg_max=16, strides=(8, 16, 32), name=None):
@@ -149,9 +154,14 @@ def build_yolo11(num_classes, width_mult=0.50, depth_mult=0.33, reg_max=16):
     p3, p4, p5 = backbone(inp)
 
     neck = build_neck([p3.shape[-1], p4.shape[-1], p5.shape[-1]], width_mult=width_mult, depth_mult=depth_mult)
-    n3, n4, n5 = neck([p3, p4, p5])
+    n4, n5, n6 = neck([p3, p4, p5])
 
-    head = DetectHeadDFL(num_classes, ch=(int(n3.shape[-1]), int(n4.shape[-1]), int(n5.shape[-1])), reg_max=reg_max, strides=(4, 8, 16))
+    head = DetectHeadDFL(
+        num_classes,
+        ch=(int(n4.shape[-1]), int(n5.shape[-1]), int(n6.shape[-1])),
+        reg_max=reg_max,
+        strides=(8, 16, 32),
+    )
 
     # Keras functional model can return dict; use subclass wrapper
     class Wrapper(keras.Model):
@@ -163,7 +173,7 @@ def build_yolo11(num_classes, width_mult=0.50, depth_mult=0.33, reg_max=16):
 
         def call(self, x, training=False):
             p3, p4, p5 = self.backbone(x, training=training)
-            n3, n4, n5 = self.neck([p3, p4, p5], training=training)
-            return self.head([n3, n4, n5], training=training)
+            n4, n5, n6 = self.neck([p3, p4, p5], training=training)
+            return self.head([n4, n5, n6], training=training)
 
     return Wrapper(backbone, neck, head)
