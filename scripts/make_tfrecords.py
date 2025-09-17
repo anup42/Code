@@ -17,7 +17,8 @@ def parse_args():
     ap.add_argument("--shards", type=int, default=8, help="Number of shards per split")
     ap.add_argument("--update_every", type=int, default=25, help="Update progress bar every N images")
     ap.add_argument("--workers", type=int, default=0, help="Parallel workers for serialization (0=auto)")
-    ap.add_argument("--mp", action="store_true", help="Use multiprocessing instead of threads")
+    ap.add_argument("--mp", action="store_true", help="Force multiprocessing workers")
+    ap.add_argument("--threads", action="store_true", help="Force thread-based workers (overrides --mp)")
     return ap.parse_args()
 
 
@@ -25,12 +26,20 @@ def main():
     args = parse_args()
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
+    if args.mp and args.threads:
+        raise ValueError("--mp and --threads are mutually exclusive")
+    if args.mp:
+        worker_mode = True
+    elif args.threads:
+        worker_mode = False
+    else:
+        worker_mode = None
     print("Writing train TFRecords...", flush=True)
     write_tfrecords_from_yaml(args.data, str(out), split='train', shards=args.shards,
-                              update_every=args.update_every, num_workers=args.workers, use_processes=args.mp)
+                              update_every=args.update_every, num_workers=args.workers, use_processes=worker_mode)
     print("Writing val TFRecords...", flush=True)
     write_tfrecords_from_yaml(args.data, str(out), split='val', shards=max(1, args.shards // 2),
-                              update_every=args.update_every, num_workers=args.workers, use_processes=args.mp)
+                              update_every=args.update_every, num_workers=args.workers, use_processes=worker_mode)
     print(f"Done. TFRecords stored under {out}", flush=True)
 
 
