@@ -7,7 +7,7 @@ from typing import List, Optional, Tuple
 import numpy as np
 import tensorflow as tf
 
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, ThreadPoolExecutor, wait
 
 from .config import AugmentationConfig
 from .utils import img2label_path, letterbox, list_images_from_dir, read_yaml
@@ -762,19 +762,38 @@ def write_tfrecords_from_yaml(
                         pb.update(done, values=[("ips", ips), ("eta_s", eta)])
         else:
             Executor = ProcessPoolExecutor if use_processes else ThreadPoolExecutor
+            max_inflight = max(1, num_workers) * 4
             with Executor(max_workers=num_workers) as ex_pool:
-                futs = [ex_pool.submit(_serialize_example_idx, (i, p)) for i, p in enumerate(files)]
+                file_iter = iter(enumerate(files))
+                pending = set()
+
+                def _submit_next():
+                    try:
+                        item = next(file_iter)
+                    except StopIteration:
+                        return False
+                    pending.add(ex_pool.submit(_serialize_example_idx, item))
+                    return True
+
+                for _ in range(min(max_inflight, n)):
+                    if not _submit_next():
+                        break
+
                 done_count = 0
-                for fut in as_completed(futs):
-                    i, ser = fut.result()
-                    writers[(i // per) % shards].write(ser)
-                    done_count += 1
-                    if pb is not None and (done_count == 1 or (done_count % update_interval == 0) or (done_count == n)):
-                        dt = max(1e-9, time.time() - t0)
-                        ips = done_count / dt
-                        remaining = n - done_count
-                        eta = remaining / ips if ips > 0 else 0.0
-                        pb.update(done_count, values=[("ips", ips), ("eta_s", eta)])
+                while pending:
+                    done_futs, _ = wait(pending, return_when=FIRST_COMPLETED)
+                    for fut in done_futs:
+                        pending.remove(fut)
+                        i, ser = fut.result()
+                        writers[(i // per) % shards].write(ser)
+                        done_count += 1
+                        if pb is not None and (done_count == 1 or (done_count % update_interval == 0) or (done_count == n)):
+                            dt = max(1e-9, time.time() - t0)
+                            ips = done_count / dt
+                            remaining = n - done_count
+                            eta = remaining / ips if ips > 0 else 0.0
+                            pb.update(done_count, values=[("ips", ips), ("eta_s", eta)])
+                        _submit_next()
     finally:
         for w in writers:
             w.close()
