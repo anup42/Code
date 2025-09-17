@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import tensorflow as tf
@@ -27,9 +27,16 @@ class TrainConfig:
 
 
 class Trainer:
-    def __init__(self, model: tf.keras.Model, cfg: TrainConfig):
+    def __init__(
+        self,
+        model: tf.keras.Model,
+        cfg: TrainConfig,
+        strategy: Optional[tf.distribute.Strategy] = None,
+    ):
         self.model = model
         self.cfg = cfg
+        self.strategy = strategy or tf.distribute.get_strategy()
+        self._num_replicas = max(1, int(getattr(self.strategy, "num_replicas_in_sync", 1)))
         self.optimizer = tf.keras.optimizers.Adam(learning_rate=cfg.lr)
         # Training state for checkpointing/resume support
         self._epoch = tf.Variable(0, dtype=tf.int32, trainable=False, name="epoch")
@@ -477,15 +484,68 @@ class Trainer:
         }
         return loss, metrics
 
+    def distribute_dataset(self, dataset: tf.data.Dataset) -> tf.data.Dataset:
+        if self._num_replicas > 1:
+            return self.strategy.experimental_distribute_dataset(dataset)
+        return dataset
+
+    def batch_size_from_dataset_elem(self, batch) -> int:
+        if isinstance(batch, (tuple, list)) and batch:
+            images = batch[0]
+        else:
+            images = batch
+        if self._num_replicas > 1 and isinstance(images, tf.distribute.DistributedValues):
+            elems = self.strategy.experimental_local_results(images)
+            total = 0
+            for elem in elems:
+                total += int(tf.shape(elem)[0].numpy())
+            return total
+        return int(tf.shape(images)[0].numpy())
+
+    def _reduce_metrics(self, metrics: Dict[str, tf.Tensor]) -> Dict[str, float]:
+        reduced = {}
+        for key, value in metrics.items():
+            v = value
+            if self._num_replicas > 1 and isinstance(value, tf.distribute.DistributedValues):
+                v = self.strategy.reduce(tf.distribute.ReduceOp.MEAN, value, axis=None)
+            if isinstance(v, tf.Tensor):
+                reduced[key] = float(v.numpy())
+            else:
+                reduced[key] = float(v)
+        return reduced
+
+    def run_train_step(self, batch) -> Dict[str, float]:
+        if self._num_replicas > 1:
+            if isinstance(batch, (tuple, list)) and len(batch) == 2:
+                images, targets = batch
+            else:
+                raise ValueError("Distributed training expects batch to be (images, targets)")
+            per_replica_metrics = self.strategy.run(self.train_step, args=(images, targets))
+            metrics = self._reduce_metrics(per_replica_metrics)
+            self._global_step.assign_add(1)
+            return metrics
+        images, targets = batch
+        metrics = self.train_step(images, targets)
+        out = {}
+        for key, value in metrics.items():
+            out[key] = float(value.numpy()) if isinstance(value, tf.Tensor) else float(value)
+        return out
+
     @tf.function(jit_compile=False, experimental_relax_shapes=True)
     def train_step(self, images, targets):
         with tf.GradientTape() as tape:
             outputs = self.model(images, training=True)
             loss, metrics = self._compute_loss_components(outputs, targets)
 
-        grads = tape.gradient(loss, self.model.trainable_variables)
+        loss_for_grad = loss
+        if self._num_replicas > 1:
+            loss_for_grad = loss / tf.cast(self._num_replicas, loss.dtype)
+
+        grads = tape.gradient(loss_for_grad, self.model.trainable_variables)
         self.optimizer.apply_gradients(zip(grads, self.model.trainable_variables))
-        self._global_step.assign_add(1)
+
+        if self._num_replicas == 1:
+            self._global_step.assign_add(1)
 
         return metrics
 

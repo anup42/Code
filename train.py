@@ -49,6 +49,8 @@ def main():
         print(f"  {k}: {getattr(args, k)}", flush=True)
 
     # Enable GPU memory growth to avoid full allocation
+    strategy = tf.distribute.get_strategy()
+    gpus = []
     try:
         # Print TensorFlow version and build info for easier debugging
         try:
@@ -71,6 +73,18 @@ def main():
             print("No GPU found, running on CPU", flush=True)
     except Exception as e:
         print(f"GPU setup warning: {e}", flush=True)
+    if gpus and len(gpus) > 1:
+        strategy = tf.distribute.MirroredStrategy()
+        print(
+            f"Using MirroredStrategy with {strategy.num_replicas_in_sync} replicas for training",
+            flush=True,
+        )
+    else:
+        print(
+            f"Using default tf.distribute strategy ({strategy.__class__.__name__}) with "
+            f"{getattr(strategy, 'num_replicas_in_sync', 1)} replica(s)",
+            flush=True,
+        )
     import time
     # Local imports for dataset utilities
     from yolo11_tf.data import load_yolo_yaml, build_file_list
@@ -111,13 +125,15 @@ def main():
     print(f"  steps_per_val: {steps_per_val}", flush=True)
 
     width_mult, depth_mult = scale_to_multipliers(args.model_scale)
-    model = build_yolo11(num_classes=num_classes, width_mult=width_mult, depth_mult=depth_mult)
-
     # prefer_gpu_ops defaults to True unless --safe_cpu is set
     prefer_gpu_ops = not bool(getattr(args, 'safe_cpu', False))
-    cfg = TrainConfig(num_classes=num_classes, img_size=args.imgsz, reg_max=16, lr=args.lr,
-                      prefer_gpu_ops=prefer_gpu_ops, debug_asserts=bool(args.debug_asserts))
-    trainer = Trainer(model, cfg)
+    with strategy.scope():
+        model = build_yolo11(num_classes=num_classes, width_mult=width_mult, depth_mult=depth_mult)
+        cfg = TrainConfig(num_classes=num_classes, img_size=args.imgsz, reg_max=16, lr=args.lr,
+                          prefer_gpu_ops=prefer_gpu_ops, debug_asserts=bool(args.debug_asserts))
+        trainer = Trainer(model, cfg, strategy=strategy)
+
+    train_iterable = trainer.distribute_dataset(train_ds)
 
     print("=== Derived configuration ===", flush=True)
     print(f"  width_mult: {width_mult}", flush=True)
@@ -185,12 +201,12 @@ def main():
         t0 = time.time()
         seen = 0
         pb = tf.keras.utils.Progbar(steps_per_epoch, stateful_metrics=["loss","cls","box","dfl","obj","pos"], unit_name="batch")
-        for step, (images, targets) in enumerate(train_ds, start=1):
+        for step, batch in enumerate(train_iterable, start=1):
             try:
-                seen += int(images.shape[0])
+                seen += trainer.batch_size_from_dataset_elem(batch)
             except Exception:
                 pass
-            metrics = trainer.train_step(images, targets)
+            metrics = trainer.run_train_step(batch)
             if step <= steps_per_epoch:
                 pb.update(step, values=[
                     ("loss", metrics['loss']), ("cls", metrics['cls']), ("box", metrics['box']), ("dfl", metrics['dfl']), ("obj", metrics.get('obj', 0.0)), ("pos", metrics['pos'])
