@@ -676,17 +676,15 @@ def _serialize_example(img_path: str):
       - shape: int64[2] (h, w)
       - labels: float32 list (flattened [N,5] rows [cls,cx,cy,w,h])
     """
-    from io import BytesIO
-    from PIL import Image  # light dependency, commonly available; avoids cv2 requirement
 
-    p = img_path
-    with open(p, 'rb') as f:
-        img_bytes = f.read()
-    with Image.open(BytesIO(img_bytes)) as im:
-        im = im.convert("RGB")
-        w, h = im.size
+    img_tensor = tf.io.read_file(img_path)
+    img = tf.image.decode_image(img_tensor, channels=3, expand_animations=False)
+    shape = tf.shape(img)
+    h = int(shape[0].numpy())
+    w = int(shape[1].numpy())
+    img_bytes = img_tensor.numpy()
 
-    labels = read_label_file(img2label_path(p)).astype(np.float32)
+    labels = read_label_file(img2label_path(img_path)).astype(np.float32)
     labels_flat = labels.reshape(-1).astype(np.float32)
 
     def _bytes_feature(v: bytes):
@@ -718,7 +716,7 @@ def write_tfrecords_from_yaml(
     shards: int = 8,
     update_every: int = 10,
     num_workers: int | None = None,
-    use_processes: bool = False,
+    use_processes: bool | None = None,
 ):
     train, val, _ = load_yolo_yaml(data_yaml)
     src = train if split == 'train' else val
@@ -748,6 +746,8 @@ def write_tfrecords_from_yaml(
                 num_workers = max(1, (os.cpu_count() or 4) // 2)
             except Exception:
                 num_workers = 4
+        if use_processes is None:
+            use_processes = num_workers > 1 and os.name != "nt"
         if num_workers == 1:
             # Sequential fallback
             for i, p in enumerate(files):

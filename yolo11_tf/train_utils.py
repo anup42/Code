@@ -527,6 +527,11 @@ class Trainer:
             out[key] = float(value.numpy()) if isinstance(value, tf.Tensor) else float(value)
         return out
 
+    def compute_loss_metrics(self, outputs, targets) -> Dict[str, tf.Tensor]:
+        loss, metrics = self._compute_loss_components(outputs, targets)
+        metrics["loss"] = tf.cast(loss, tf.float32)
+        return metrics
+
     @tf.function(jit_compile=False, experimental_relax_shapes=True)
     def train_step(self, images, targets):
         with tf.GradientTape() as tape:

@@ -221,28 +221,21 @@ def main():
         # Evaluate PR/mAP with progress bar on validation
         print("Validating...")
         pb_val = tf.keras.utils.Progbar(steps_per_val, stateful_metrics=["p","r","mAP50","mAP50-95"], unit_name="val")
-        # Optionally limit val_ds to args.val_steps using take()
-        val_loss_iter = val_ds.take(steps_per_val) if steps_per_val else val_ds
-        val_loss_totals = {key: 0.0 for key in ("loss", "cls", "box", "dfl", "obj", "pos")}
-        val_batches = 0
-        for batch in val_loss_iter:
-            try:
-                v_images, v_targets = trainer.extract_images_targets(batch)
-            except ValueError as e:
-                raise ValueError(
-                    "Validation dataset element does not provide (images, targets)"
-                ) from e
-            val_metrics = trainer.validation_step(v_images, v_targets)
-            val_batches += 1
-            for key in val_loss_totals:
-                val_loss_totals[key] += float(val_metrics[key].numpy())
-        avg_val_loss = val_loss_totals['loss'] / max(1, val_batches)
-
         val_iter = val_ds.take(steps_per_val) if steps_per_val else val_ds
-        p, r, m50, m5095 = evaluate_dataset_pr_maps_fast(
-            model, val_iter, num_classes, conf_thres=0.001, iou_thres=0.5, max_det=300, imgsz=args.imgsz,
-            progbar=pb_val, total_steps=steps_per_val,
+        p, r, m50, m5095, val_loss_metrics = evaluate_dataset_pr_maps_fast(
+            model,
+            val_iter,
+            num_classes,
+            conf_thres=0.001,
+            iou_thres=0.5,
+            max_det=300,
+            imgsz=args.imgsz,
+            progbar=pb_val,
+            total_steps=steps_per_val,
+            trainer=trainer,
+            return_loss=True,
         )
+        avg_val_loss = val_loss_metrics['loss']
         dt = time.time() - t0
         ips = (seen / dt) if dt > 0 else 0.0
         print(
