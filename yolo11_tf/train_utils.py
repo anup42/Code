@@ -542,7 +542,22 @@ class Trainer:
             loss_for_grad = loss / tf.cast(self._num_replicas, loss.dtype)
 
         grads = tape.gradient(loss_for_grad, self.model.trainable_variables)
-        self.optimizer.apply_gradients(zip(grads, self.model.trainable_variables))
+        if grads is None:
+            grads = []
+
+        all_none = True
+        processed_grads = []
+        for grad, var in zip(grads, self.model.trainable_variables):
+            if grad is None:
+                processed_grads.append(tf.zeros_like(var))
+            else:
+                processed_grads.append(grad)
+                all_none = False
+
+        if all_none:
+            return metrics
+
+        self.optimizer.apply_gradients(zip(processed_grads, self.model.trainable_variables))
 
         if self._num_replicas == 1:
             self._global_step.assign_add(1)
