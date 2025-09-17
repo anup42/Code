@@ -490,9 +490,9 @@ class Trainer:
         return dataset
 
     def batch_size_from_dataset_elem(self, batch) -> int:
-        if isinstance(batch, (tuple, list)) and batch:
-            images = batch[0]
-        else:
+        try:
+            images, _ = self.extract_images_targets(batch)
+        except ValueError:
             images = batch
         if self._num_replicas > 1 and isinstance(images, tf.distribute.DistributedValues):
             elems = self.strategy.experimental_local_results(images)
@@ -515,16 +515,12 @@ class Trainer:
         return reduced
 
     def run_train_step(self, batch) -> Dict[str, float]:
-        if self._num_replicas > 1:
-            if isinstance(batch, (tuple, list)) and len(batch) == 2:
-                images, targets = batch
-            else:
-                raise ValueError("Distributed training expects batch to be (images, targets)")
+        images, targets = self.extract_images_targets(batch)
+        if self._num_replicas > 1 and isinstance(images, tf.distribute.DistributedValues):
             per_replica_metrics = self.strategy.run(self.train_step, args=(images, targets))
             metrics = self._reduce_metrics(per_replica_metrics)
             self._global_step.assign_add(1)
             return metrics
-        images, targets = batch
         metrics = self.train_step(images, targets)
         out = {}
         for key, value in metrics.items():
@@ -569,6 +565,38 @@ class Trainer:
         outputs = self.model(images, training=False)
         _, metrics = self._compute_loss_components(outputs, targets)
         return metrics
+
+    def extract_images_targets(self, batch):
+        images, targets = self._extract_images_targets(batch)
+        if images is None or targets is None:
+            raise ValueError("Batch does not contain both images and targets")
+        return images, targets
+
+    def _extract_images_targets(self, batch):
+        if isinstance(batch, dict):
+            images = None
+            targets = None
+            for key in ("images", "image", "x"):
+                if key in batch:
+                    images = batch[key]
+                    break
+            for key in ("targets", "target", "labels", "y"):
+                if key in batch:
+                    targets = batch[key]
+                    break
+            return images, targets
+        if isinstance(batch, (tuple, list)):
+            if len(batch) >= 2:
+                first, second = batch[0], batch[1]
+                if isinstance(first, (tuple, list)):
+                    if len(first) >= 2:
+                        return first[0], first[1]
+                    return self._extract_images_targets(first)
+                return first, second
+            if len(batch) == 1:
+                return self._extract_images_targets(batch[0])
+            return None, None
+        return batch, None
 
 
 # =====================
