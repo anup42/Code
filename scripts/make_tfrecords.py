@@ -25,13 +25,13 @@ def main():
     args = parse_args()
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
-    print("Writing train TFRecords...")
+    print("Writing train TFRecords...", flush=True)
     write_tfrecords_from_yaml(args.data, str(out), split='train', shards=args.shards,
                               update_every=args.update_every, num_workers=args.workers, use_processes=args.mp)
-    print("Writing val TFRecords...")
+    print("Writing val TFRecords...", flush=True)
     write_tfrecords_from_yaml(args.data, str(out), split='val', shards=max(1, args.shards // 2),
                               update_every=args.update_every, num_workers=args.workers, use_processes=args.mp)
-    print(f"Done. TFRecords stored under {out}")
+    print(f"Done. TFRecords stored under {out}", flush=True)
 
 
 if __name__ == "__main__":

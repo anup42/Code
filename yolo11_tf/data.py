@@ -729,6 +729,7 @@ def write_tfrecords_from_yaml(
     writers = []
     for s in range(shards):
         writers.append(tf.io.TFRecordWriter(os.path.join(out_dir, f"{split}-{s:03d}.tfrecord")))
+    print(f"[{split}] Found {n} images. Writing TFRecords to {out_dir}", flush=True)
     # Progress bar
     pb = None
     if n > 0:
@@ -738,6 +739,7 @@ def write_tfrecords_from_yaml(
             pb = None
     import time
     t0 = time.time()
+    update_interval = max(1, int(update_every))
     try:
         # Parallel serialization (threads by default for portability; opt-in processes)
         if num_workers is None or num_workers <= 0:
@@ -752,7 +754,7 @@ def write_tfrecords_from_yaml(
                 writers[(i // per) % shards].write(ex)
                 if pb is not None:
                     done = i + 1
-                    if (done % max(1, int(update_every)) == 0) or (done == n):
+                    if done == 1 or (done % update_interval == 0) or (done == n):
                         dt = max(1e-9, time.time() - t0)
                         ips = done / dt
                         remaining = n - done
@@ -767,7 +769,7 @@ def write_tfrecords_from_yaml(
                     i, ser = fut.result()
                     writers[(i // per) % shards].write(ser)
                     done_count += 1
-                    if pb is not None and ((done_count % max(1, int(update_every)) == 0) or (done_count == n)):
+                    if pb is not None and (done_count == 1 or (done_count % update_interval == 0) or (done_count == n)):
                         dt = max(1e-9, time.time() - t0)
                         ips = done_count / dt
                         remaining = n - done_count
