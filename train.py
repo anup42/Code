@@ -26,6 +26,7 @@ def parse_args():
     ap.add_argument("--fast", action="store_true", help="Prefer GPU kernels for gather/top-k/scatter (faster)")
     ap.add_argument("--safe_cpu", action="store_true", help="Force CPU for gather/top-k/scatter (stability)")
     ap.add_argument("--debug_asserts", action="store_true", help="Enable runtime index assertions (slower)")
+    ap.add_argument("--mlp", action="store_true", help="Enable MLP mode (logs TensorBoard data to /tensorboard)")
     return ap.parse_args()
 
 
@@ -143,7 +144,11 @@ def main():
     # Checkpoint manager for saving/resuming
     ckpt_dir = os.path.join(args.out, "ckpt")
     ckpt_manager = tf.train.CheckpointManager(trainer.ckpt, ckpt_dir, max_to_keep=5)
-    tb_dir = os.path.join(args.out, "tb")
+    if getattr(args, "mlp", False):
+        tb_dir = "/tensorboard"
+    else:
+        tb_dir = os.path.join(args.out, "tb")
+    os.makedirs(tb_dir, exist_ok=True)
     best_val_loss_path = os.path.join(args.out, "best_val_loss.txt")
 
     print("=== Output locations ===", flush=True)
