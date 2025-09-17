@@ -19,7 +19,7 @@ class DatasetConfig:
     batch_size: int = 16
     num_classes: int = 80
     # Strides should match model output downsampling ratios
-    strides: Tuple[int, int, int] = (4, 8, 16)
+    strides: Tuple[int, int, int] = (8, 16, 32)
     max_labels: int = 300  # per image
     augmentation: Optional[AugmentationConfig] = None
 
