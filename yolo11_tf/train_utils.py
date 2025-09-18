@@ -299,6 +299,9 @@ class Trainer:
             num_pos = tf.reduce_sum(tf.cast(mask, tf.float32)) + 1e-9
             total_pos += num_pos
 
+            num_segments = B * HW
+            obj_target_flat = tf.zeros(tf.stack([num_segments]), dtype=tf.float32)
+
             # For classification: build targets per location (one-hot per GT) squeezed onto unique indices.
             # Simpler: compute classification loss only at positive gt selections.
             pos_coords = tf.where(mask)
@@ -343,11 +346,21 @@ class Trainer:
                 )
                 total_box += box_loss
 
-                # Objectness on positives
-                pred_obj_pos = self._gather_hw(obj_map, b_idx, lin_idx, name="lin_idx")  # [M,1]
-                obj_pos_tgt = tf.ones_like(pred_obj_pos)
-                obj_pos_loss = tf.reduce_mean(bce_with_logits_loss(pred_obj_pos, obj_pos_tgt))
-                total_obj += obj_pos_loss
+                inter_x1 = tf.maximum(px1, x1)
+                inter_y1 = tf.maximum(py1, y1)
+                inter_x2 = tf.minimum(px2, x2)
+                inter_y2 = tf.minimum(py2, y2)
+                inter = tf.maximum(0.0, inter_x2 - inter_x1) * tf.maximum(0.0, inter_y2 - inter_y1)
+                area_p = tf.maximum(0.0, (px2 - px1)) * tf.maximum(0.0, (py2 - py1))
+                area_g = tf.maximum(0.0, (x2 - x1)) * tf.maximum(0.0, (y2 - y1))
+                union = area_p + area_g - inter + 1e-9
+                iou_pos = tf.where(union > 0.0, inter / union, tf.zeros_like(inter))
+                flat_idx = b_idx * HW + lin_idx
+                obj_target_flat = tf.tensor_scatter_nd_add(
+                    obj_target_flat,
+                    tf.expand_dims(flat_idx, axis=1),
+                    tf.stop_gradient(iou_pos),
+                )
 
             # Center-radius assignment for extra cls/obj positives with IoU weighting (task-aligned)
             r = tf.constant(2.5, dtype=tf.float32)
@@ -383,7 +396,7 @@ class Trainer:
             gt_choice = tf.argmin(d_masked, axis=1, output_type=tf.int32)  # [B,N]
             pos_pairs = tf.where(any_ok)  # [M,2] (b, n)
 
-            def _cr_additions():
+            def _cr_additions(obj_flat):
                 b_pos = tf.cast(pos_pairs[:, 0], tf.int32)
                 n_pos = tf.cast(pos_pairs[:, 1], tf.int32)
                 g_pos = tf.gather_nd(gt_choice, pos_pairs)  # [M]
@@ -452,19 +465,32 @@ class Trainer:
                 cls_loss_pts = tf.reduce_sum(
                     cls_loss_pts * tf.where(tf.size(w) > 0, w[:, None], tf.zeros_like(cls_loss_pts))
                 ) / (tf.reduce_sum(w) + 1e-9)
-                obj_pos_loss2 = tf.reduce_sum(
-                    bce_with_logits_loss(pred_obj_pts, tf.ones_like(pred_obj_pts))
-                    * tf.where(tf.size(w) > 0, w[:, None], tf.zeros_like(pred_obj_pts))
-                ) / (tf.reduce_sum(w) + 1e-9)
-                return cls_loss_pts, obj_pos_loss2
+                flat_idx_cr = b_sel * HW + n_pos_sel
+                obj_flat = tf.tensor_scatter_nd_add(
+                    obj_flat,
+                    tf.expand_dims(flat_idx_cr, axis=1),
+                    tf.cast(tf.stop_gradient(w), tf.float32),
+                )
+                return cls_loss_pts, obj_flat
 
-            def _no_cr():
+            def _no_cr(obj_flat):
                 z = tf.constant(0.0, tf.float32)
-                return z, z
+                return z, obj_flat
 
-            add_cls, add_obj = tf.cond(tf.shape(pos_pairs)[0] > 0, _cr_additions, _no_cr)
+            add_cls, obj_target_flat = tf.cond(
+                tf.shape(pos_pairs)[0] > 0,
+                lambda: _cr_additions(obj_target_flat),
+                lambda: _no_cr(obj_target_flat),
+            )
             total_cls += add_cls
-            total_obj += add_obj
+
+            obj_target = tf.reshape(
+                tf.clip_by_value(obj_target_flat, 0.0, 1.0),
+                tf.stack([B, HW, tf.constant(1, dtype=tf.int32)]),
+            )
+            obj_loss_map = bce_with_logits_loss(obj_map, obj_target)
+            obj_loss = tf.reduce_mean(obj_loss_map)
+            total_obj += obj_loss
 
         # combine losses
         loss = (
