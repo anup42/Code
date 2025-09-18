@@ -63,12 +63,8 @@ def build_neck(feat_channels, width_mult=0.50, depth_mult=0.33):
     p4_dn = ConvBnSiLU(ch(256), 3, 2)(p4_out)
     p5_out = C2f(ch(256), n(3))(L.Concatenate(axis=-1)([p4_dn, p5_td]))
 
-    # Additional downsample head for stride 32 outputs (large objects)
-    p5_dn = ConvBnSiLU(ch(256), 3, 2)(p5_out)
-    p6_out = C2f(ch(256), n(3))(p5_dn)
-
-    # Return only strides (8,16,32) for detection head
-    return keras.Model([p3, p4, p5], [p4_out, p5_out, p6_out], name="neck")
+    # Return strides (8, 16, 32) for the detection head
+    return keras.Model([p3, p4, p5], [p3_out, p4_out, p5_out], name="neck")
 
 
 class DetectHeadDFL(keras.Model):
@@ -154,11 +150,11 @@ def build_yolo11(num_classes, width_mult=0.50, depth_mult=0.33, reg_max=16):
     p3, p4, p5 = backbone(inp)
 
     neck = build_neck([p3.shape[-1], p4.shape[-1], p5.shape[-1]], width_mult=width_mult, depth_mult=depth_mult)
-    n4, n5, n6 = neck([p3, p4, p5])
+    n3, n4, n5 = neck([p3, p4, p5])
 
     head = DetectHeadDFL(
         num_classes,
-        ch=(int(n4.shape[-1]), int(n5.shape[-1]), int(n6.shape[-1])),
+        ch=(int(n3.shape[-1]), int(n4.shape[-1]), int(n5.shape[-1])),
         reg_max=reg_max,
         strides=(8, 16, 32),
     )
@@ -173,7 +169,7 @@ def build_yolo11(num_classes, width_mult=0.50, depth_mult=0.33, reg_max=16):
 
         def call(self, x, training=False):
             p3, p4, p5 = self.backbone(x, training=training)
-            n4, n5, n6 = self.neck([p3, p4, p5], training=training)
-            return self.head([n4, n5, n6], training=training)
+            n3, n4, n5 = self.neck([p3, p4, p5], training=training)
+            return self.head([n3, n4, n5], training=training)
 
     return Wrapper(backbone, neck, head)
