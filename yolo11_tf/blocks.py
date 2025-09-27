@@ -74,22 +74,23 @@ class DetectHead(keras.Model):
     def __init__(self, num_classes, ch=(256, 256, 256), name=None):
         super().__init__(name=name)
         self.num_classes = num_classes
-        self.stems = []
-        self.cls_convs = []
-        self.reg_convs = []
-        self.cls_preds = []
-        self.box_preds = []
+        stems, cls_convs, reg_convs, cls_preds, box_preds = [], [], [], [], []
         for i, c in enumerate(ch):
             stem = ConvBnSiLU(c, 1, 1, name=f"stem_{i}")
             cls_conv = keras.Sequential([ConvBnSiLU(c, 3, 1), ConvBnSiLU(c, 3, 1)], name=f"cls_conv_{i}")
             reg_conv = keras.Sequential([ConvBnSiLU(c, 3, 1), ConvBnSiLU(c, 3, 1)], name=f"reg_conv_{i}")
             cls_pred = L.Conv2D(num_classes, 1, 1, padding="same", name=f"cls_pred_{i}")
             box_pred = L.Conv2D(4 + 1, 1, 1, padding="same", name=f"box_pred_{i}")  # 4 box + 1 obj
-            self.stems.append(stem)
-            self.cls_convs.append(cls_conv)
-            self.reg_convs.append(reg_conv)
-            self.cls_preds.append(cls_pred)
-            self.box_preds.append(box_pred)
+            stems.append(stem)
+            cls_convs.append(cls_conv)
+            reg_convs.append(reg_conv)
+            cls_preds.append(cls_pred)
+            box_preds.append(box_pred)
+        self.stems = stems
+        self.cls_convs = cls_convs
+        self.reg_convs = reg_convs
+        self.cls_preds = cls_preds
+        self.box_preds = box_preds
 
     def call(self, feats, training=False):
         outputs = []
@@ -102,3 +103,4 @@ class DetectHead(keras.Model):
             out = tf.concat([box_out, cls_out], axis=-1)
             outputs.append(out)
         return outputs
+
