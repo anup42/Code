@@ -83,13 +83,8 @@ class DetectHeadDFL(keras.Model):
         self.reg_max = reg_max
         self.bins = reg_max + 1
         self.strides = strides
-        self.stems = []
-        self.cls_convs = []
-        self.reg_convs = []
-        self.obj_convs = []
-        self.cls_preds = []
-        self.reg_preds = []
-        self.obj_preds = []
+        stems, cls_convs, reg_convs, obj_convs = [], [], [], []
+        cls_preds, reg_preds, obj_preds = [], [], []
         for i, c in enumerate(ch):
             stem = ConvBnSiLU(c, 1, 1, name=f"stem_{i}")
             cls_conv = keras.Sequential([ConvBnSiLU(c, 3, 1), ConvBnSiLU(c, 3, 1)], name=f"cls_conv_{i}")
@@ -98,13 +93,20 @@ class DetectHeadDFL(keras.Model):
             reg_pred = L.Conv2D(4 * self.bins, 1, 1, padding="same", name=f"reg_pred_{i}")
             obj_conv = keras.Sequential([ConvBnSiLU(c, 3, 1)], name=f"obj_conv_{i}")
             obj_pred = L.Conv2D(1, 1, 1, padding="same", name=f"obj_pred_{i}")
-            self.stems.append(stem)
-            self.cls_convs.append(cls_conv)
-            self.reg_convs.append(reg_conv)
-            self.obj_convs.append(obj_conv)
-            self.cls_preds.append(cls_pred)
-            self.reg_preds.append(reg_pred)
-            self.obj_preds.append(obj_pred)
+            stems.append(stem)
+            cls_convs.append(cls_conv)
+            reg_convs.append(reg_conv)
+            obj_convs.append(obj_conv)
+            cls_preds.append(cls_pred)
+            reg_preds.append(reg_pred)
+            obj_preds.append(obj_pred)
+        self.stems = stems
+        self.cls_convs = cls_convs
+        self.reg_convs = reg_convs
+        self.obj_convs = obj_convs
+        self.cls_preds = cls_preds
+        self.reg_preds = reg_preds
+        self.obj_preds = obj_preds
 
     def call(self, feats, training=False):
         cls_list = []
@@ -173,3 +175,4 @@ def build_yolo11(num_classes, width_mult=0.50, depth_mult=0.33, reg_max=16):
             return self.head([n3, n4, n5], training=training)
 
     return Wrapper(backbone, neck, head)
+
