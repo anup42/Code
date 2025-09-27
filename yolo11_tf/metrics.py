@@ -58,7 +58,6 @@ def decode_maps_to_dets_np(pred, conf_thres=0.25, iou_thres=0.5, max_det=300, im
     if isinstance(pred, dict) and all(k in pred for k in ("cls", "reg", "grids", "strides")):
         cls_list = [p.numpy() if isinstance(p, tf.Tensor) else p for p in pred["cls"]]
         reg_list = [p.numpy() if isinstance(p, tf.Tensor) else p for p in pred["reg"]]
-        obj_list = [p.numpy() if isinstance(p, tf.Tensor) else p for p in pred.get("obj", [np.zeros_like(cls_list[0][..., :1]) for _ in pred["cls"]])]
         grids = [g.numpy() if isinstance(g, tf.Tensor) else g for g in pred["grids"]]
         strides = pred["strides"]
         B = cls_list[0].shape[0]
@@ -67,7 +66,6 @@ def decode_maps_to_dets_np(pred, conf_thres=0.25, iou_thres=0.5, max_det=300, im
         # Concatenate across scales
         cls_all = np.concatenate(cls_list, axis=1)  # [B,N,C]
         reg_all = np.concatenate(reg_list, axis=1)  # [B,N,4*bins]
-        obj_all = np.concatenate(obj_list, axis=1)  # [B,N,1]
         grid_all = np.concatenate(grids, axis=0)    # [N,2]
         # Build stride per point aligned with concatenation
         stride_vec = np.concatenate([np.full((g.shape[0],), float(strides[i]), dtype=np.float32) for i, g in enumerate(grids)], axis=0)  # [N]
@@ -95,17 +93,19 @@ def decode_maps_to_dets_np(pred, conf_thres=0.25, iou_thres=0.5, max_det=300, im
             boxes = np.stack([x1 / img_w, y1 / img_h, x2 / img_w, y2 / img_h], axis=-1)
             # class scores
             scores_c = 1.0 / (1.0 + np.exp(-cls_all[b]))  # [N,C]
-            obj_b = 1.0 / (1.0 + np.exp(-obj_all[b][:, 0]))  # [N]
+            if scores_c.shape[0] == 0:
+                outs[b] = np.zeros((0, 6), dtype=np.float32)
+                continue
             # light prefilter: keep many candidates to avoid dropping TPs early
             topk = min(max_det * 50, scores_c.shape[0])
-            max_cls = (scores_c * obj_b[:, None]).max(axis=1)
+            topk = max(1, topk)
+            max_cls = scores_c.max(axis=1)
             top_idx = np.argpartition(-max_cls, kth=topk - 1)[:topk]
             boxes_f = boxes[top_idx]
             scores_c_f = scores_c[top_idx]
-            obj_f = obj_b[top_idx]
             dets_b = []
             for c in range(C):
-                sc = scores_c_f[:, c] * obj_f
+                sc = scores_c_f[:, c]
                 mask = sc >= conf_thres
                 if not np.any(mask):
                     continue
