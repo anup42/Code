@@ -110,8 +110,8 @@ class TaskAlignedAssignerTF:
             norm_align_metric = tf.reduce_max(
                 align_metric * pos_overlaps / (pos_align_metrics + self.eps),
                 axis=-2,
-                keepdims=True,
             )
+            norm_align_metric = tf.expand_dims(norm_align_metric, axis=-1)
             target_scores = target_scores * norm_align_metric
             return target_labels, target_bboxes, target_scores, tf.cast(fg_mask > 0, tf.bool), target_gt_idx
 
