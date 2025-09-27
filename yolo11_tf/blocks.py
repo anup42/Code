@@ -1,3 +1,5 @@
+import math
+import numpy as np
 import tensorflow as tf
 from tensorflow import keras
 from tensorflow.keras import layers as L
@@ -74,13 +76,17 @@ class DetectHead(keras.Model):
     def __init__(self, num_classes, ch=(256, 256, 256), name=None):
         super().__init__(name=name)
         self.num_classes = num_classes
+        prior_prob = 0.01
+        prior_logit = -math.log((1.0 - prior_prob) / prior_prob)
+        cls_bias_init = tf.keras.initializers.Constant(prior_logit)
+        obj_bias_vector = np.concatenate([np.zeros(4, dtype=np.float32), np.full((1,), prior_logit, dtype=np.float32)])
         stems, cls_convs, reg_convs, cls_preds, box_preds = [], [], [], [], []
         for i, c in enumerate(ch):
             stem = ConvBnSiLU(c, 1, 1, name=f"stem_{i}")
             cls_conv = keras.Sequential([ConvBnSiLU(c, 3, 1), ConvBnSiLU(c, 3, 1)], name=f"cls_conv_{i}")
             reg_conv = keras.Sequential([ConvBnSiLU(c, 3, 1), ConvBnSiLU(c, 3, 1)], name=f"reg_conv_{i}")
-            cls_pred = L.Conv2D(num_classes, 1, 1, padding="same", name=f"cls_pred_{i}")
-            box_pred = L.Conv2D(4 + 1, 1, 1, padding="same", name=f"box_pred_{i}")  # 4 box + 1 obj
+            cls_pred = L.Conv2D(num_classes, 1, 1, padding="same", bias_initializer=cls_bias_init, name=f"cls_pred_{i}")
+            box_pred = L.Conv2D(4 + 1, 1, 1, padding="same", bias_initializer=tf.keras.initializers.Constant(obj_bias_vector), name=f"box_pred_{i}")  # 4 box + 1 obj
             stems.append(stem)
             cls_convs.append(cls_conv)
             reg_convs.append(reg_conv)
@@ -103,4 +109,5 @@ class DetectHead(keras.Model):
             out = tf.concat([box_out, cls_out], axis=-1)
             outputs.append(out)
         return outputs
+
 

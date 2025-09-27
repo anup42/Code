@@ -37,7 +37,10 @@ class Trainer:
         self.cfg = cfg
         self.strategy = strategy or tf.distribute.get_strategy()
         self._num_replicas = max(1, int(getattr(self.strategy, "num_replicas_in_sync", 1)))
-        self.optimizer = tf.keras.optimizers.Adam(learning_rate=cfg.lr)
+        if cfg.weight_decay > 0:
+            self.optimizer = tf.keras.optimizers.AdamW(learning_rate=cfg.lr, weight_decay=cfg.weight_decay)
+        else:
+            self.optimizer = tf.keras.optimizers.Adam(learning_rate=cfg.lr)
         # Training state for checkpointing/resume support
         self._epoch = tf.Variable(0, dtype=tf.int32, trainable=False, name="epoch")
         self._global_step = tf.Variable(0, dtype=tf.int64, trainable=False, name="global_step")

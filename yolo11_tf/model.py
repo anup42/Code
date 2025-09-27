@@ -1,9 +1,9 @@
+import math
 import tensorflow as tf
 from tensorflow import keras
 from tensorflow.keras import layers as L
 
 from .blocks import ConvBnSiLU, C2f, SPPF
-from tensorflow.keras import layers as L
 
 
 def build_backbone(width_mult=0.50, depth_mult=0.33):
@@ -83,16 +83,20 @@ class DetectHeadDFL(keras.Model):
         self.reg_max = reg_max
         self.bins = reg_max + 1
         self.strides = strides
+        prior_prob = 0.01
+        prior_logit = -math.log((1.0 - prior_prob) / prior_prob)
+        cls_bias_init = tf.keras.initializers.Constant(prior_logit)
+        obj_bias_init = tf.keras.initializers.Constant(prior_logit)
         stems, cls_convs, reg_convs, obj_convs = [], [], [], []
         cls_preds, reg_preds, obj_preds = [], [], []
         for i, c in enumerate(ch):
             stem = ConvBnSiLU(c, 1, 1, name=f"stem_{i}")
             cls_conv = keras.Sequential([ConvBnSiLU(c, 3, 1), ConvBnSiLU(c, 3, 1)], name=f"cls_conv_{i}")
             reg_conv = keras.Sequential([ConvBnSiLU(c, 3, 1), ConvBnSiLU(c, 3, 1)], name=f"reg_conv_{i}")
-            cls_pred = L.Conv2D(num_classes, 1, 1, padding="same", name=f"cls_pred_{i}")
+            cls_pred = L.Conv2D(num_classes, 1, 1, padding="same", bias_initializer=cls_bias_init, name=f"cls_pred_{i}")
             reg_pred = L.Conv2D(4 * self.bins, 1, 1, padding="same", name=f"reg_pred_{i}")
             obj_conv = keras.Sequential([ConvBnSiLU(c, 3, 1)], name=f"obj_conv_{i}")
-            obj_pred = L.Conv2D(1, 1, 1, padding="same", name=f"obj_pred_{i}")
+            obj_pred = L.Conv2D(1, 1, 1, padding="same", bias_initializer=obj_bias_init, name=f"obj_pred_{i}")
             stems.append(stem)
             cls_convs.append(cls_conv)
             reg_convs.append(reg_conv)
