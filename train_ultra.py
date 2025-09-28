@@ -1,6 +1,7 @@
 import argparse
 import os
 
+import numpy as np
 import tensorflow as tf
 
 from yolo11_tf.config import load_config
@@ -117,15 +118,26 @@ def main():
         num_classes=num_classes,
         img_size=imgsz,
         reg_max=16,
-        lr=lr,
-        weight_decay=train_settings.weight_decay,
+        lr0=lr,
+        lrf=train_settings.lrf,
+        momentum=train_settings.momentum,
         warmup_epochs=train_settings.warmup_epochs,
+        warmup_momentum=train_settings.warmup_momentum,
+        warmup_bias_lr=train_settings.warmup_bias_lr,
+        weight_decay=train_settings.weight_decay,
+        optimizer=train_settings.optimizer,
+        batch_size=batch,
+        nbs=train_settings.nbs,
+        cos_lr=train_settings.cos_lr,
         box_loss_gain=loss_settings.box,
         cls_loss_gain=loss_settings.cls,
         dfl_loss_gain=loss_settings.dfl,
         epochs=epochs,
     )
     trainer = Trainer(model, train_cfg)
+    trainer.set_learning_rate(trainer.base_lr)
+    trainer.set_momentum(train_cfg.momentum)
+    train_ds = trainer.distribute_dataset(train_ds)
 
     ckpt_dir = os.path.join(args.out, "ckpt")
     ckpt_manager = tf.train.CheckpointManager(trainer.ckpt, ckpt_dir, max_to_keep=5)
@@ -153,38 +165,99 @@ def main():
         print(f"Checkpoint already completed {initial_epoch} epochs (>= {epochs}). Nothing to do.", flush=True)
         return
 
-    # Simple training loop
+    warmup_iters = int(max(round(train_cfg.warmup_epochs * steps_per_epoch), 100)) if train_cfg.warmup_epochs > 0 else 0
+
+    # Simple training loop following Ultralytics' scheduling behaviour
     for epoch in range(initial_epoch, epochs):
         print(f"Epoch {epoch+1}/{epochs}")
         t0 = time.time()
         seen = 0
-        # Train epoch with progress bar
-        pb = tf.keras.utils.Progbar(steps_per_epoch, stateful_metrics=["loss","cls","box","dfl","pos"], unit_name="batch")
-        for step, (images, targets) in enumerate(train_ds, start=1):
-            try:
-                seen += int(images.shape[0])
-            except Exception:
-                pass
-            metrics = trainer.train_step(images, targets)
-            if step <= steps_per_epoch:
-                pb.update(step, values=[
-                    ("loss", metrics['loss']), ("cls", metrics['cls']), ("box", metrics['box']), ("dfl", metrics['dfl']), ("pos", metrics['pos'])
-                ])
-            if step >= steps_per_epoch:
-                break
-        # Eval quick metrics at epoch end (mAP@0.5 on val)
-        val_iter = val_ds.take(steps_per_val).map(
-            lambda img, tgt: ((img, tf.zeros([tf.shape(tgt)[0], train_cfg.max_boxes, 5], dtype=tf.float32)), tgt)
+        running = {}
+        pb = tf.keras.utils.Progbar(
+            steps_per_epoch,
+            stateful_metrics=["loss", "cls", "box", "dfl", "obj", "pos"],
+            unit_name="batch",
         )
-        p, r, m = evaluate_dataset_map50(model, val_iter, num_classes, conf_thres=0.05, iou_thres=0.5, imgsz=imgsz)
+        step_in_epoch = 0
+        for step, batch in enumerate(train_ds, start=1):
+            if step > steps_per_epoch:
+                break
+            step_in_epoch = step
+            ni = epoch * steps_per_epoch + (step - 1)
+            progress = epoch + (step - 1) / float(max(steps_per_epoch, 1))
+            target_lr = trainer.base_lr * trainer.lr_factor(progress)
+            if warmup_iters > 0 and ni <= warmup_iters:
+                warmup_start = 0.0
+                if train_cfg.warmup_bias_lr and (train_cfg.optimizer.lower() == "sgd"):
+                    scale = float(train_cfg.batch_size) / float(train_cfg.nbs) if train_cfg.nbs else 1.0
+                    warmup_start = float(train_cfg.warmup_bias_lr) * scale
+                lr_now = float(np.interp(ni, [0, warmup_iters], [warmup_start, target_lr]))
+                mom_now = float(
+                    np.interp(ni, [0, warmup_iters], [train_cfg.warmup_momentum, train_cfg.momentum])
+                )
+            else:
+                lr_now = target_lr
+                mom_now = train_cfg.momentum
+            trainer.set_learning_rate(lr_now)
+            trainer.set_momentum(mom_now)
+
+            metrics = trainer.run_train_step(batch)
+            seen += trainer.batch_size_from_dataset_elem(batch)
+            if not running:
+                running = {k: 0.0 for k in metrics}
+            for key, value in metrics.items():
+                running[key] += float(value)
+
+            values = [
+                ("loss", metrics.get("loss", 0.0)),
+                ("cls", metrics.get("cls", 0.0)),
+                ("box", metrics.get("box", 0.0)),
+                ("dfl", metrics.get("dfl", 0.0)),
+            ]
+            if "obj" in metrics:
+                values.append(("obj", metrics["obj"]))
+            if "pos" in metrics:
+                values.append(("pos", metrics["pos"]))
+            pb.update(step, values=values)
+
+            if step % max(1, args.log_every) == 0 or step == steps_per_epoch:
+                avg_metrics = {k: running[k] / step for k in running}
+                metric_str = " ".join(
+                    f"{name}={avg_metrics.get(name, 0.0):.4f}" for name in ("loss", "cls", "box", "dfl", "obj") if name in avg_metrics
+                )
+                print(
+                    f"Epoch {epoch+1}/{epochs} step {step}/{steps_per_epoch} "
+                    f"lr={trainer.current_learning_rate():.5f} mom={trainer.current_momentum():.3f} {metric_str}",
+                    flush=True,
+                )
+
+        if step_in_epoch == 0:
+            print("No training steps were executed this epoch.", flush=True)
+            epoch_metrics = {k: 0.0 for k in ("loss", "cls", "box", "dfl", "obj", "pos")}
+        else:
+            epoch_metrics = {k: running[k] / step_in_epoch for k in running}
+
+        # Eval quick metrics at epoch end (mAP@0.5 on val)
+        val_iter = val_ds.take(steps_per_val)
+        p, r, m = evaluate_dataset_map50(
+            model,
+            val_iter,
+            num_classes,
+            conf_thres=train_cfg.conf_thres,
+            iou_thres=train_cfg.iou_thres,
+            max_det=train_cfg.max_det,
+            imgsz=imgsz,
+        )
         dt = time.time() - t0
         ips = (seen / dt) if dt > 0 else 0.0
         print(
             f"Epoch {epoch+1}/{epochs} done in {dt:.1f}s ({ips:.1f} img/s) - "
-            f"last_loss={metrics['loss']:.3f}  P={p:.4f} R={r:.4f} mAP50={m:.4f}",
+            f"lr={trainer.current_learning_rate():.5f} "
+            f"loss={epoch_metrics.get('loss', 0.0):.4f} cls={epoch_metrics.get('cls', 0.0):.4f} "
+            f"box={epoch_metrics.get('box', 0.0):.4f} dfl={epoch_metrics.get('dfl', 0.0):.4f} "
+            f"obj={epoch_metrics.get('obj', 0.0):.4f} P={p:.4f} R={r:.4f} mAP50={m:.4f}",
             flush=True,
         )
-        print(f"Epoch {epoch+1}/{epochs} — loss={metrics['loss']:.2f}  P={p:.4f} R={r:.4f} mAP50={m:.4f}")
 
         trainer.assign_epoch(epoch + 1)
         save_path = ckpt_manager.save(checkpoint_number=epoch + 1)

@@ -3,9 +3,16 @@ train:
   imgsz: 640
   batch: 16
   epochs: 100
-  lr0: 0.001
+  lr0: 0.01
+  lrf: 0.01
+  momentum: 0.937
   warmup_epochs: 3.0
+  warmup_momentum: 0.8
+  warmup_bias_lr: 0.1
   weight_decay: 0.0005
+  optimizer: SGD
+  nbs: 64
+  cos_lr: false
 loss:
   box: 7.5
   cls: 0.5

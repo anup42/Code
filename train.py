@@ -130,8 +130,15 @@ def main():
     prefer_gpu_ops = not bool(getattr(args, 'safe_cpu', False))
     with strategy.scope():
         model = build_yolo11(num_classes=num_classes, width_mult=width_mult, depth_mult=depth_mult)
-        cfg = TrainConfig(num_classes=num_classes, img_size=args.imgsz, reg_max=16, lr=args.lr,
-                          prefer_gpu_ops=prefer_gpu_ops, debug_asserts=bool(args.debug_asserts))
+        cfg = TrainConfig(
+            num_classes=num_classes,
+            img_size=args.imgsz,
+            reg_max=16,
+            lr0=args.lr,
+            batch_size=args.batch,
+            prefer_gpu_ops=prefer_gpu_ops,
+            debug_asserts=bool(args.debug_asserts),
+        )
         trainer = Trainer(model, cfg, strategy=strategy)
 
     train_iterable = trainer.distribute_dataset(train_ds)
