@@ -59,26 +59,23 @@ class Trainer:
         if self.cfg.batch_size and self.cfg.nbs:
             base_lr *= float(self.cfg.batch_size) / float(self.cfg.nbs)
         self.base_lr = base_lr
-        self._lr_var = tf.Variable(base_lr, dtype=tf.float32, trainable=False, name="train_lr")
 
         opt_name = (self.cfg.optimizer or "sgd").lower()
-        self._momentum_var = None
         if opt_name == "sgd":
-            self._momentum_var = tf.Variable(self.cfg.momentum, dtype=tf.float32, trainable=False, name="train_momentum")
             self.optimizer = tf.keras.optimizers.SGD(
-                learning_rate=self._lr_var,
-                momentum=self._momentum_var,
+                learning_rate=base_lr,
+                momentum=self.cfg.momentum,
                 nesterov=True,
             )
         elif opt_name == "adamw":
-            self.optimizer = tf.keras.optimizers.AdamW(learning_rate=self._lr_var, weight_decay=self.cfg.weight_decay)
+            self.optimizer = tf.keras.optimizers.AdamW(learning_rate=base_lr, weight_decay=self.cfg.weight_decay)
         elif opt_name == "adam":
-            self.optimizer = tf.keras.optimizers.Adam(learning_rate=self._lr_var)
+            self.optimizer = tf.keras.optimizers.Adam(learning_rate=base_lr)
         else:
             if self.cfg.weight_decay > 0:
-                self.optimizer = tf.keras.optimizers.AdamW(learning_rate=self._lr_var, weight_decay=self.cfg.weight_decay)
+                self.optimizer = tf.keras.optimizers.AdamW(learning_rate=base_lr, weight_decay=self.cfg.weight_decay)
             else:
-                self.optimizer = tf.keras.optimizers.Adam(learning_rate=self._lr_var)
+                self.optimizer = tf.keras.optimizers.Adam(learning_rate=base_lr)
 
         # Track which variables receive weight decay when emulating SGD training.
         if self.cfg.weight_decay > 0 and opt_name == "sgd":
