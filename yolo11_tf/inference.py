@@ -14,12 +14,12 @@ class YoloInferencer:
         head = getattr(model, "head", None)
         self.reg_max = getattr(head, "reg_max", 16)
 
-    def _decode_outputs(self, cls_list, reg_list, grids, strides, img_h, img_w):
-        boxes_all: List[tf.Tensor] = []
-        scores_all: List[tf.Tensor] = []
+    def _decode_outputs(self, cls_list, reg_list, obj_list, grids, strides, img_h, img_w):
+        boxes_all = []
+        scores_all = []
         batch = tf.shape(cls_list[0])[0]
 
-        for cls_map, reg_map, pts, stride in zip(cls_list, reg_list, grids, strides):
+        for cls_map, reg_map, obj_map, pts, stride in zip(cls_list, reg_list, obj_list, grids, strides):
             stride = tf.cast(stride, tf.float32)
             dist = integral_distribution(reg_map, reg_max=self.reg_max) * stride
             pts = tf.cast(pts, tf.float32)
@@ -38,7 +38,7 @@ class YoloInferencer:
             x2n = tf.clip_by_value(x2 / img_w_f, 0.0, 1.0)
             boxes = tf.stack([y1n, x1n, y2n, x2n], axis=-1)
             boxes_all.append(boxes)
-            scores_all.append(tf.sigmoid(cls_map))
+            scores_all.append(tf.sigmoid(cls_map) * tf.sigmoid(obj_map))
 
         boxes = tf.concat(boxes_all, axis=1)
         scores = tf.concat(scores_all, axis=1)
@@ -53,13 +53,14 @@ class YoloInferencer:
         out = self.model(images, training=False)
         cls_list = out["cls"]
         reg_list = out["reg"]
+        obj_list = out.get("obj", [tf.zeros_like(cls_list[0])[..., :1]] * len(cls_list))
         grids = out["grids"]
         strides = out["strides"]
 
         img_h = tf.cast(tf.shape(images)[1], tf.float32)
         img_w = tf.cast(tf.shape(images)[2], tf.float32)
 
-        return self._decode_outputs(cls_list, reg_list, grids, strides, img_h, img_w)
+        return self._decode_outputs(cls_list, reg_list, obj_list, grids, strides, img_h, img_w)
 
     def predict(self, images: tf.Tensor):
         return self._forward(images)
@@ -67,7 +68,7 @@ class YoloInferencer:
     def predict_from_outputs(self, outputs: dict, img_h, img_w):
         cls_list = outputs["cls"]
         reg_list = outputs["reg"]
+        obj_list = outputs.get("obj", [tf.zeros_like(cls_list[0])[..., :1]] * len(cls_list))
         grids = outputs["grids"]
         strides = outputs["strides"]
-        return self._decode_outputs(cls_list, reg_list, grids, strides, img_h, img_w)
-
+        return self._decode_outputs(cls_list, reg_list, obj_list, grids, strides, img_h, img_w)

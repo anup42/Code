@@ -4,199 +4,8 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import tensorflow as tf
 
-from .losses import bce_with_logits_loss, bbox_ciou, integral_distribution
+from .losses import bce_with_logits_loss, dfl_loss, bbox_ciou, integral_distribution
 
-
-
-def dist2bbox_tf(distance: tf.Tensor, anchor_points: tf.Tensor, xywh: bool = False) -> tf.Tensor:
-    distance = tf.convert_to_tensor(distance, dtype=tf.float32)
-    anchor_points = tf.convert_to_tensor(anchor_points, dtype=tf.float32)
-    anchor = anchor_points
-    if tf.rank(anchor_points) == 2:
-        anchor = tf.expand_dims(anchor_points, axis=0)
-    while tf.rank(anchor) < tf.rank(distance):
-        anchor = tf.expand_dims(anchor, axis=0)
-    lt, rb = tf.split(distance, 2, axis=-1)
-    anchor = tf.cast(anchor, distance.dtype)
-    x1y1 = anchor - lt
-    x2y2 = anchor + rb
-    if xywh:
-        c_xy = (x1y1 + x2y2) / 2.0
-        wh = x2y2 - x1y1
-        return tf.concat([c_xy, wh], axis=-1)
-    return tf.concat([x1y1, x2y2], axis=-1)
-
-
-def bbox2dist_tf(anchor_points: tf.Tensor, bboxes: tf.Tensor, reg_max: int) -> tf.Tensor:
-    anchor_points = tf.convert_to_tensor(anchor_points, dtype=tf.float32)
-    bboxes = tf.convert_to_tensor(bboxes, dtype=tf.float32)
-    anchor = anchor_points
-    if tf.rank(anchor_points) == 2:
-        anchor = tf.expand_dims(anchor_points, axis=0)
-    while tf.rank(anchor) < tf.rank(bboxes):
-        anchor = tf.expand_dims(anchor, axis=0)
-    x1y1, x2y2 = tf.split(bboxes, 2, axis=-1)
-    anchor = tf.cast(anchor, bboxes.dtype)
-    dists = tf.concat([anchor - x1y1, x2y2 - anchor], axis=-1)
-    return tf.clip_by_value(dists, 0.0, float(reg_max) - 0.01)
-
-
-def bbox_iou_ciou_tf(pred_boxes: tf.Tensor, gt_boxes: tf.Tensor) -> tf.Tensor:
-    pred_boxes = tf.convert_to_tensor(pred_boxes, dtype=tf.float32)
-    gt_boxes = tf.convert_to_tensor(gt_boxes, dtype=tf.float32)
-    ciou_loss = bbox_ciou(pred_boxes, gt_boxes)
-    return tf.maximum(1.0 - ciou_loss, 0.0)
-
-
-def distribution_focal_loss_tf(logits: tf.Tensor, target: tf.Tensor, reg_max: int) -> tf.Tensor:
-    bins = reg_max + 1
-    target = tf.clip_by_value(target, 0.0, float(reg_max))
-    tl = tf.floor(target)
-    tr = tf.minimum(tl + 1.0, float(reg_max))
-    wl = tr - target
-    wr = target - tl
-    tl = tf.cast(tl, tf.int32)
-    tr = tf.cast(tr, tf.int32)
-    log_prob = tf.nn.log_softmax(logits, axis=-1)
-    onehot_l = tf.one_hot(tl, depth=bins, dtype=log_prob.dtype)
-    onehot_r = tf.one_hot(tr, depth=bins, dtype=log_prob.dtype)
-    ce_l = -tf.reduce_sum(onehot_l * log_prob, axis=-1)
-    ce_r = -tf.reduce_sum(onehot_r * log_prob, axis=-1)
-    return wl * ce_l + wr * ce_r
-
-
-class TaskAlignedAssignerTF:
-    def __init__(self, topk: int = 10, num_classes: int = 80, alpha: float = 0.5, beta: float = 6.0, eps: float = 1e-9):
-        self.topk = topk
-        self.num_classes = num_classes
-        self.alpha = alpha
-        self.beta = beta
-        self.eps = eps
-
-    def __call__(
-        self,
-        pd_scores: tf.Tensor,
-        pd_bboxes: tf.Tensor,
-        anc_points: tf.Tensor,
-        gt_labels: tf.Tensor,
-        gt_bboxes: tf.Tensor,
-        mask_gt: tf.Tensor,
-    ) -> Tuple[tf.Tensor, tf.Tensor, tf.Tensor, tf.Tensor, tf.Tensor]:
-        bs = tf.shape(pd_scores)[0]
-        n_max_boxes = tf.shape(gt_bboxes)[1]
-        num_anchors = tf.shape(pd_scores)[1]
-
-        def no_targets():
-            target_labels = tf.fill([bs, num_anchors], tf.cast(self.num_classes, tf.int32))
-            target_bboxes = tf.zeros([bs, num_anchors, 4], dtype=tf.float32)
-            target_scores = tf.zeros([bs, num_anchors, self.num_classes], dtype=tf.float32)
-            fg_mask = tf.zeros([bs, num_anchors], dtype=tf.bool)
-            target_gt_idx = tf.zeros([bs, num_anchors], dtype=tf.int32)
-            return target_labels, target_bboxes, target_scores, fg_mask, target_gt_idx
-
-        def assign():
-            mask_candidates = self.select_candidates_in_gts(anc_points, gt_bboxes)
-            mask_gt_bool = tf.cast(mask_gt, tf.bool)
-            mask_gt_full = tf.broadcast_to(mask_gt_bool, tf.shape(mask_candidates))
-            align_metric, overlaps = self.get_box_metrics(pd_scores, pd_bboxes, gt_labels, gt_bboxes, mask_candidates & mask_gt_full)
-            topk_mask = tf.tile(mask_gt_bool, [1, 1, self.topk])
-            mask_topk = self.select_topk_candidates(align_metric, topk_mask=topk_mask)
-            mask_pos = mask_topk * tf.cast(mask_candidates, mask_topk.dtype) * tf.cast(mask_gt_full, mask_topk.dtype)
-            target_gt_idx, fg_mask, mask_pos = self.select_highest_overlaps(mask_pos, overlaps)
-            target_labels, target_bboxes, target_scores = self.get_targets(gt_labels, gt_bboxes, target_gt_idx, fg_mask)
-            align_metric = align_metric * mask_pos
-            pos_align_metrics = tf.reduce_max(align_metric, axis=-1, keepdims=True)
-            pos_overlaps = tf.reduce_max(overlaps * mask_pos, axis=-1, keepdims=True)
-            norm_align_metric = tf.reduce_max(
-                align_metric * pos_overlaps / (pos_align_metrics + self.eps),
-                axis=-2,
-            )
-            norm_align_metric = tf.expand_dims(norm_align_metric, axis=-1)
-            target_scores = target_scores * norm_align_metric
-            return target_labels, target_bboxes, target_scores, tf.cast(fg_mask > 0, tf.bool), target_gt_idx
-
-        return tf.cond(tf.equal(n_max_boxes, 0), no_targets, assign)
-
-    def select_candidates_in_gts(self, anc_points: tf.Tensor, gt_bboxes: tf.Tensor) -> tf.Tensor:
-        anc_points = tf.cast(anc_points, tf.float32)
-        gt_bboxes = tf.cast(gt_bboxes, tf.float32)
-        anc = tf.reshape(anc_points, [1, 1, -1, 2])
-        x1y1 = gt_bboxes[..., :2][..., None, :]
-        x2y2 = gt_bboxes[..., 2:][..., None, :]
-        deltas = tf.concat([anc - x1y1, x2y2 - anc], axis=-1)
-        return tf.reduce_min(deltas, axis=-1) > 0.0
-
-    def get_box_metrics(
-        self,
-        pd_scores: tf.Tensor,
-        pd_bboxes: tf.Tensor,
-        gt_labels: tf.Tensor,
-        gt_bboxes: tf.Tensor,
-        mask_gt: tf.Tensor,
-    ) -> Tuple[tf.Tensor, tf.Tensor]:
-        mask_gt_bool = tf.cast(mask_gt, tf.bool)
-        bs = tf.shape(pd_scores)[0]
-        n_max_boxes = tf.shape(gt_bboxes)[1]
-        num_anchors = tf.shape(pd_scores)[1]
-        gt_labels_squeezed = tf.squeeze(tf.cast(gt_labels, tf.int32), axis=-1)
-        one_hot = tf.one_hot(gt_labels_squeezed, depth=self.num_classes, dtype=pd_scores.dtype)
-        score_per_gt = tf.einsum('bmc,bnc->bmn', one_hot, pd_scores)
-        bbox_scores = tf.where(mask_gt_bool, score_per_gt, tf.zeros_like(score_per_gt))
-        pred_boxes = tf.expand_dims(pd_bboxes, axis=1)
-        gt_boxes = tf.expand_dims(gt_bboxes, axis=2)
-        overlaps = bbox_iou_ciou_tf(pred_boxes, gt_boxes)
-        overlaps = tf.where(mask_gt_bool, overlaps, tf.zeros_like(overlaps))
-        align_metric = tf.pow(bbox_scores, self.alpha) * tf.pow(overlaps, self.beta)
-        return align_metric, overlaps
-
-    def select_topk_candidates(self, metrics: tf.Tensor, topk_mask: tf.Tensor | None = None) -> tf.Tensor:
-        k = self.topk
-        topk_vals, topk_idx = tf.math.top_k(metrics, k=k, sorted=False)
-        if topk_mask is None:
-            topk_valid = tf.reduce_max(topk_vals, axis=-1, keepdims=True) > self.eps
-            topk_mask = tf.tile(topk_valid, [1, 1, k])
-        depth = tf.shape(metrics)[-1]
-        one_hot = tf.one_hot(topk_idx, depth=depth, dtype=tf.int32)
-        one_hot = one_hot * tf.cast(topk_mask[..., None], tf.int32)
-        count_tensor = tf.reduce_sum(one_hot, axis=-2)
-        count_tensor = tf.where(count_tensor > 1, 0, count_tensor)
-        return tf.cast(count_tensor, metrics.dtype)
-
-    def select_highest_overlaps(self, mask_pos: tf.Tensor, overlaps: tf.Tensor) -> Tuple[tf.Tensor, tf.Tensor, tf.Tensor]:
-        fg_mask = tf.reduce_sum(mask_pos, axis=-2)
-        mask_multi = fg_mask > 1
-        n_boxes = tf.shape(mask_pos)[1]
-        if tf.reduce_any(mask_multi):
-            mask_multi_gts = tf.tile(mask_multi[:, tf.newaxis, :], [1, n_boxes, 1])
-            max_overlaps_idx = tf.argmax(overlaps, axis=1)
-            is_max = tf.one_hot(max_overlaps_idx, depth=n_boxes, axis=1, dtype=mask_pos.dtype)
-            mask_pos = tf.where(mask_multi_gts, is_max, mask_pos)
-            fg_mask = tf.reduce_sum(mask_pos, axis=-2)
-        target_gt_idx = tf.argmax(mask_pos, axis=-2, output_type=tf.int32)
-        return target_gt_idx, fg_mask, mask_pos
-
-    def get_targets(
-        self,
-        gt_labels: tf.Tensor,
-        gt_bboxes: tf.Tensor,
-        target_gt_idx: tf.Tensor,
-        fg_mask: tf.Tensor,
-    ) -> Tuple[tf.Tensor, tf.Tensor, tf.Tensor]:
-        bs = tf.shape(gt_labels)[0]
-        n_max_boxes = tf.shape(gt_labels)[1]
-        num_anchors = tf.shape(target_gt_idx)[1]
-        batch_ind = tf.range(bs, dtype=tf.int32)[:, None]
-        flat_gt_idx = target_gt_idx + batch_ind * n_max_boxes
-        flat_labels = tf.reshape(tf.cast(gt_labels, tf.int32), [-1])
-        target_labels = tf.gather(flat_labels, flat_gt_idx)
-        flat_bboxes = tf.reshape(tf.cast(gt_bboxes, tf.float32), [-1, 4])
-        target_bboxes = tf.gather(flat_bboxes, flat_gt_idx)
-        target_labels = tf.where(fg_mask > 0, target_labels, tf.zeros_like(target_labels))
-        max_label = tf.cast(self.num_classes - 1, target_labels.dtype)
-        target_labels = tf.clip_by_value(target_labels, 0, max_label)
-        target_scores = tf.one_hot(target_labels, depth=self.num_classes, dtype=tf.float32)
-        target_scores = tf.where(fg_mask[..., None] > 0, target_scores, tf.zeros_like(target_scores))
-        return target_labels, target_bboxes, target_scores
 
 @dataclass
 class TrainConfig:
@@ -232,7 +41,6 @@ class Trainer:
             self.optimizer = tf.keras.optimizers.AdamW(learning_rate=cfg.lr, weight_decay=cfg.weight_decay)
         else:
             self.optimizer = tf.keras.optimizers.Adam(learning_rate=cfg.lr)
-        self.assigner = TaskAlignedAssignerTF(topk=10, num_classes=cfg.num_classes)
         # Training state for checkpointing/resume support
         self._epoch = tf.Variable(0, dtype=tf.int32, trainable=False, name="epoch")
         self._global_step = tf.Variable(0, dtype=tf.int64, trainable=False, name="global_step")
@@ -327,87 +135,372 @@ class Trainer:
         # Already provided per forward pass
         return outputs["grids"], outputs["strides"]
 
+    def _assign_targets(self, targets, grids, strides):
+        """Simplified one-to-one assignment: for each GT, pick closest point
+        on a scale chosen by size thresholds.
+        targets: [B, max_boxes, 6] -> [cls, x1,y1,x2,y2, valid]
+        Returns per-scale tensors:
+          pos_idx: list of [B, K] indices into HW per scale (-1 for none)
+          pos_targs: list of dicts with 'cls': [B, K, C], 'ltrb': [B, K, 4], 'boxes': [B, K, 4]
+        """
+        B = tf.shape(targets)[0]
+        maxb = tf.shape(targets)[1]
+        C = self.cfg.num_classes
+        # size thresholds (on sqrt(area)) with widened ranges for multi-scale assignment
+        s_small = 64.0
+        s_large = 160.0
+        low_margin = 0.75
+        high_margin = 1.25
+
+        pos_idx_list = []
+        pos_targ_list = []
+
+        for si, (pts, stride) in enumerate(zip(grids, strides)):
+            N = tf.shape(pts)[0]
+            pts_b = tf.tile(pts[None, ...], [B, 1, 1])  # [B, N, 2]
+
+            # Initialize with -1 indices (no assignment)
+            pos_idx = tf.fill([B, maxb], tf.constant(-1, dtype=tf.int32))
+
+            cls_ids = tf.cast(targets[..., 0], tf.int32)
+            x1, y1, x2, y2, v = tf.split(targets[..., 1:6], [1, 1, 1, 1, 1], axis=-1)
+            w = tf.squeeze(x2 - x1, -1)
+            h = tf.squeeze(y2 - y1, -1)
+            size = tf.sqrt(tf.maximum(w * h, 0.0))
+
+            # choose scale mask (widened boundaries, allow overlap between adjacent scales)
+            if si == 0:
+                scale_mask = size < (s_small * high_margin)
+            elif si == 1:
+                scale_mask = tf.logical_and(size >= (s_small * low_margin), size < (s_large * high_margin))
+            else:
+                scale_mask = size >= (s_large * low_margin)
+            scale_mask = tf.logical_and(scale_mask, tf.squeeze(v > 0.5, -1))
+
+            # centers
+            cx = (x1 + x2) / 2.0
+            cy = (y1 + y2) / 2.0
+            centers = tf.concat([cx, cy], axis=-1)  # [B, maxb, 2]
+
+            # Distance from points to centers
+            # pts_b: [B, N, 2], centers: [B, maxb, 2]
+            d = tf.norm(
+                tf.expand_dims(pts_b, axis=2) - tf.expand_dims(centers, axis=1),
+                axis=-1,
+            )  # [B, N, maxb]
+
+            # Prefer points inside the GT box (center sampling)
+            pts_x = tf.expand_dims(pts_b[..., 0], -1)  # [B,N,1]
+            pts_y = tf.expand_dims(pts_b[..., 1], -1)  # [B,N,1]
+            x1t = tf.transpose(x1, [0, 2, 1])  # [B,1,maxb]
+            y1t = tf.transpose(y1, [0, 2, 1])
+            x2t = tf.transpose(x2, [0, 2, 1])
+            y2t = tf.transpose(y2, [0, 2, 1])
+            inside = tf.logical_and(tf.logical_and(pts_x >= x1t, pts_x <= x2t),
+                                     tf.logical_and(pts_y >= y1t, pts_y <= y2t))  # [B,N,maxb]
+            big = tf.constant(1e9, dtype=d.dtype)
+            d_inside = tf.where(inside, d, tf.fill(tf.shape(d), big))
+            nearest_inside = tf.argmin(d_inside, axis=1, output_type=tf.int32)  # [B,maxb]
+            has_inside = tf.reduce_any(inside, axis=1)  # [B,maxb]
+            nearest_any = tf.argmin(d, axis=1, output_type=tf.int32)
+            chosen = tf.where(has_inside, nearest_inside, nearest_any)
+
+            # Mask out invalids by setting idx to -1
+            pos_idx = tf.where(scale_mask, chosen, tf.fill(tf.shape(chosen), tf.constant(-1, dtype=tf.int32)))
+
+            # Build targets for valid ones without scatter updates (GPU kernels were unstable)
+            valid_mask = scale_mask
+            mask_f = tf.cast(valid_mask, tf.float32)
+
+            # Class one-hot targets with masking and optional sanity checks
+            cls_ids_masked = tf.where(valid_mask, cls_ids, tf.zeros_like(cls_ids))
+            max_cls = tf.constant(self.cfg.num_classes, dtype=cls_ids_masked.dtype)
+            cls_in_range = tf.logical_and(cls_ids_masked >= 0, cls_ids_masked < max_cls)
+            cls_valid_mask = tf.logical_and(valid_mask, cls_in_range)
+            if getattr(self.cfg, 'debug_asserts', False):
+                cls_vals = tf.boolean_mask(cls_ids_masked, valid_mask)
+                def _check_cls():
+                    with tf.control_dependencies([
+                        tf.debugging.assert_greater_equal(tf.reduce_min(cls_vals), 0, message="cls ids negative"),
+                        tf.debugging.assert_less(tf.reduce_max(cls_vals), max_cls, message="cls ids >= num_classes"),
+                    ]):
+                        return tf.constant(0, dtype=cls_vals.dtype)
+                _ = tf.cond(tf.size(cls_vals) > 0, _check_cls, lambda: tf.constant(0, dtype=cls_vals.dtype))
+            cls_ids_safe = tf.where(cls_valid_mask, cls_ids_masked, tf.zeros_like(cls_ids_masked))
+            cls_oh_full = tf.one_hot(cls_ids_safe, depth=self.cfg.num_classes, dtype=tf.float32)
+            cls_t = cls_oh_full * tf.cast(cls_valid_mask[..., None], tf.float32)
+
+            # Gather selected points for every GT (fallback to index 0 when invalid, later masked out)
+            safe_pos_idx = tf.where(valid_mask, pos_idx, tf.zeros_like(pos_idx))
+            if getattr(self.cfg, 'debug_asserts', False):
+                pos_vals = tf.boolean_mask(pos_idx, valid_mask)
+                def _check_pos():
+                    with tf.control_dependencies([
+                        tf.debugging.assert_greater_equal(tf.reduce_min(pos_vals), 0, message="pos_idx negative"),
+                        tf.debugging.assert_less(tf.reduce_max(pos_vals), tf.shape(pts)[0], message="pos_idx >= HW"),
+                    ]):
+                        return tf.constant(0, dtype=pos_vals.dtype)
+                _ = tf.cond(tf.size(pos_vals) > 0, _check_pos, lambda: tf.constant(0, dtype=pos_vals.dtype))
+            max_hw = tf.maximum(tf.shape(pts)[0] - 1, 0)
+            safe_pos_idx = tf.clip_by_value(safe_pos_idx, 0, max_hw)
+            safe_pos_idx_flat = tf.reshape(safe_pos_idx, [-1])
+            pts_full = tf.reshape(tf.gather(pts, safe_pos_idx_flat), [B, maxb, 2])
+
+            gx1_full = tf.squeeze(x1, -1)
+            gy1_full = tf.squeeze(y1, -1)
+            gx2_full = tf.squeeze(x2, -1)
+            gy2_full = tf.squeeze(y2, -1)
+
+            l = (pts_full[..., 0] - gx1_full) / float(stride)
+            t = (pts_full[..., 1] - gy1_full) / float(stride)
+            r = (gx2_full - pts_full[..., 0]) / float(stride)
+            b = (gy2_full - pts_full[..., 1]) / float(stride)
+            dists_full = tf.stack([l, t, r, b], axis=-1)
+            dists_full = tf.clip_by_value(dists_full, 0.0, float(self.cfg.reg_max))
+            ltrb_t = dists_full * mask_f[..., None]
+
+            boxes_full = tf.stack([gx1_full, gy1_full, gx2_full, gy2_full], axis=-1)
+            box_t = boxes_full * mask_f[..., None]
+
+            pos_idx_list.append(pos_idx)
+            pos_targ_list.append({"cls": cls_t, "ltrb": ltrb_t, "boxes": box_t})
+
+        return pos_idx_list, pos_targ_list
+
     def _compute_loss_components(self, outputs, targets):
         cls_outs: List[tf.Tensor] = outputs["cls"]
         reg_outs: List[tf.Tensor] = outputs["reg"]
+        obj_outs: List[tf.Tensor] = outputs.get("obj", [tf.zeros_like(outputs["cls"][0])[..., :1]] * len(cls_outs))
         grids = outputs["grids"]
         strides = outputs["strides"]
 
-        bins = self.cfg.reg_max + 1
+        pos_idx, pos_targs = self._assign_targets(targets, grids, strides)
 
-        cls_list = []
-        reg_list = []
-        anchor_points_grid = []
-        stride_list = []
-        for i, (cls_map, reg_map, grid) in enumerate(zip(cls_outs, reg_outs, grids)):
-            cls_map = tf.cast(cls_map, tf.float32)
-            reg_map = tf.cast(reg_map, tf.float32)
-            grid = tf.cast(grid, tf.float32)
-            stride = tf.cast(strides[i], tf.float32)
-            cls_list.append(cls_map)
-            reg_list.append(reg_map)
-            anchor_points_grid.append(grid / stride)
-            stride_list.append(tf.ones([tf.shape(grid)[0], 1], dtype=tf.float32) * stride)
+        total_cls = tf.constant(0.0, dtype=tf.float32)
+        total_box = tf.constant(0.0, dtype=tf.float32)
+        total_dfl = tf.constant(0.0, dtype=tf.float32)
+        total_pos = tf.constant(0.0, dtype=tf.float32)
+        total_obj = tf.constant(0.0, dtype=tf.float32)
 
-        pred_scores = tf.concat(cls_list, axis=1)
-        reg_pred = tf.concat(reg_list, axis=1)
-        anchor_points_grid = tf.concat(anchor_points_grid, axis=0)
-        stride_tensor = tf.concat(stride_list, axis=0)
-        anchor_points_pixel = anchor_points_grid * stride_tensor
+        for si in range(len(cls_outs)):
+            cls_map = cls_outs[si]
+            reg_map = reg_outs[si]
+            obj_map = obj_outs[si]
+            pts = grids[si]
+            stride = tf.cast(strides[si], tf.float32)
 
-        pred_scores_prob = tf.nn.sigmoid(pred_scores)
-        pred_dist_expect = integral_distribution(reg_pred, self.cfg.reg_max)
-        pred_bboxes_grid = dist2bbox_tf(pred_dist_expect, anchor_points_grid)
-        pred_bboxes = pred_bboxes_grid * stride_tensor[None, :, :]
+            # gather positives per image using indices
+            idx = pos_idx[si]  # [B, maxb] indices into HW or -1
+            B = tf.shape(cls_map)[0]
+            HW = tf.shape(cls_map)[1]
+            C = tf.shape(cls_map)[2]
 
-        gt_labels = tf.cast(targets[..., 0:1], tf.int32)
-        gt_bboxes = tf.cast(targets[..., 1:5], tf.float32)
-        mask_gt = tf.cast(targets[..., 5:6] > 0.5, tf.bool)
+            # Sanity: grid size should match HW
+            tf.debugging.assert_equal(tf.shape(pts)[0], HW, message="Grid HW mismatch against head output")
 
-        target_labels, target_bboxes, target_scores, fg_mask, _ = self.assigner(
-            pred_scores_prob,
-            pred_bboxes,
-            anchor_points_pixel,
-            gt_labels,
-            gt_bboxes,
-            mask_gt,
-        )
+            mask = idx >= 0  # [B, maxb]
+            num_pos = tf.reduce_sum(tf.cast(mask, tf.float32)) + 1e-9
+            total_pos += num_pos
 
-        target_bboxes_grid = target_bboxes / stride_tensor[None, :, :]
-        target_scores_sum = tf.maximum(tf.reduce_sum(target_scores), 1.0)
+            num_segments = B * HW
+            obj_target_flat = tf.zeros(tf.stack([num_segments]), dtype=tf.float32)
 
-        cls_loss_map = bce_with_logits_loss(pred_scores, target_scores)
-        total_cls = tf.reduce_sum(cls_loss_map) / target_scores_sum
+            # For classification: build targets per location (one-hot per GT) squeezed onto unique indices.
+            # Simpler: compute classification loss only at positive gt selections.
+            pos_coords = tf.where(mask)
+            pos_coords = tf.cast(pos_coords, tf.int32)
+            lin_idx = tf.zeros([0], dtype=tf.int32)
+            if tf.shape(pos_coords)[0] > 0:
+                b_idx = pos_coords[:, 0]
+                lin_idx = tf.gather_nd(idx, pos_coords)  # [M]
+                if getattr(self.cfg, 'debug_asserts', False):
+                    lin_idx = self._assert_indices_in_range(lin_idx, HW, name="lin_idx")
+                pred_cls_sel = self._gather_hw(cls_map, b_idx, lin_idx, name="lin_idx")  # [M, C]
 
-        weight = tf.reduce_sum(target_scores, axis=-1)
-        fg_mask_bool = fg_mask
-        indices = tf.where(fg_mask_bool)
-        total_pos = tf.reduce_sum(tf.cast(fg_mask_bool, tf.float32))
+                tgt_cls = self._gather_nd_cpu(pos_targs[si]["cls"], pos_coords)  # [M, C]
+                cls_loss = tf.reduce_sum(bce_with_logits_loss(pred_cls_sel, tgt_cls)) / num_pos
+                total_cls += cls_loss
 
-        pred_dist_logits = tf.reshape(reg_pred, [tf.shape(reg_pred)[0], -1, 4, bins])
-        target_ltrb = bbox2dist_tf(anchor_points_grid, target_bboxes_grid, self.cfg.reg_max)
+                # Regression and DFL on positives
+                pred_reg_sel = self._gather_hw(reg_map, b_idx, lin_idx, name="lin_idx")  # [M, 4*(R)]
+                bins = self.cfg.reg_max + 1
+                pred_reg_sel = tf.reshape(pred_reg_sel, [-1, 4, bins])
+                tgt_ltrb = tf.gather_nd(pos_targs[si]["ltrb"], pos_coords)  # [M, 4]
+                dfl = dfl_loss(pred_reg_sel, tgt_ltrb, self.cfg.reg_max)
+                total_dfl += dfl
 
-        def no_pos():
-            return tf.constant(0.0, tf.float32), tf.constant(0.0, tf.float32)
+                # decode boxes for IoU loss
+                # compute point coords for selected indices
+                pts_sel = tf.gather(pts, lin_idx)  # [M, 2] (no gradient to model outputs)
+                # distances in strides
+                dist = tgt_ltrb * stride
+                x1 = pts_sel[:, 0] - dist[:, 0]
+                y1 = pts_sel[:, 1] - dist[:, 1]
+                x2 = pts_sel[:, 0] + dist[:, 2]
+                y2 = pts_sel[:, 1] + dist[:, 3]
+                pred_dist = integral_distribution(tf.expand_dims(pred_reg_sel, 0), self.cfg.reg_max)[0]
+                pred_dist_pix = pred_dist * stride
+                px1 = pts_sel[:, 0] - pred_dist_pix[:, 0]
+                py1 = pts_sel[:, 1] - pred_dist_pix[:, 1]
+                px2 = pts_sel[:, 0] + pred_dist_pix[:, 2]
+                py2 = pts_sel[:, 1] + pred_dist_pix[:, 3]
+                box_loss = tf.reduce_mean(
+                    bbox_ciou(tf.stack([px1, py1, px2, py2], axis=-1), tf.stack([x1, y1, x2, y2], axis=-1))
+                )
+                total_box += box_loss
 
-        def pos_losses():
-            weight_fg = tf.gather_nd(weight, indices)
-            pred_boxes_fg = tf.gather_nd(pred_bboxes_grid, indices)
-            target_boxes_fg = tf.gather_nd(target_bboxes_grid, indices)
-            ciou_loss = bbox_ciou(pred_boxes_fg, target_boxes_fg)
-            loss_iou = tf.reduce_sum(ciou_loss * weight_fg) / target_scores_sum
-            pred_dist_fg = tf.gather_nd(pred_dist_logits, indices)
-            target_ltrb_fg = tf.gather_nd(target_ltrb, indices)
-            dfl_per = distribution_focal_loss_tf(pred_dist_fg, target_ltrb_fg, self.cfg.reg_max)
-            loss_dfl = tf.reduce_sum(dfl_per * tf.expand_dims(weight_fg, -1)) / target_scores_sum
-            return loss_iou, loss_dfl
+                inter_x1 = tf.maximum(px1, x1)
+                inter_y1 = tf.maximum(py1, y1)
+                inter_x2 = tf.minimum(px2, x2)
+                inter_y2 = tf.minimum(py2, y2)
+                inter = tf.maximum(0.0, inter_x2 - inter_x1) * tf.maximum(0.0, inter_y2 - inter_y1)
+                area_p = tf.maximum(0.0, (px2 - px1)) * tf.maximum(0.0, (py2 - py1))
+                area_g = tf.maximum(0.0, (x2 - x1)) * tf.maximum(0.0, (y2 - y1))
+                union = area_p + area_g - inter + 1e-9
+                iou_pos = tf.where(union > 0.0, inter / union, tf.zeros_like(inter))
+                flat_idx = b_idx * HW + lin_idx
+                obj_target_flat = tf.tensor_scatter_nd_add(
+                    obj_target_flat,
+                    tf.expand_dims(flat_idx, axis=1),
+                    tf.stop_gradient(iou_pos),
+                )
 
-        total_box, total_dfl = tf.cond(tf.shape(indices)[0] > 0, pos_losses, no_pos)
+            # Center-radius assignment for extra cls/obj positives with IoU weighting (task-aligned)
+            r = tf.constant(2.5, dtype=tf.float32)
+            radius_pix = r * stride
+            # Prepare targets fields
+            t_cls_full = tf.cast(targets[..., 0], tf.int32)  # [B,maxb]
+            tx1 = targets[..., 1:2]
+            ty1 = targets[..., 2:3]
+            tx2 = targets[..., 3:4]
+            ty2 = targets[..., 4:5]
+            tvalid = targets[..., 5:6] > 0.5
+            # centers and distances
+            tcx = (tx1 + tx2) / 2.0
+            tcy = (ty1 + ty2) / 2.0
+            centers = tf.concat([tcx, tcy], axis=-1)  # [B,maxb,2]
+            pts_b = tf.tile(pts[None, ...], [B, 1, 1])  # [B,N,2]
+            diff = tf.expand_dims(pts_b, axis=1) - tf.expand_dims(centers, axis=2)  # [B,maxb,N,2]
+            d_all = tf.norm(diff, axis=-1)  # [B,maxb,N]
+            # inside mask
+            pts_x = tf.expand_dims(pts_b[..., 0], axis=1)  # [B,1,N]
+            pts_y = tf.expand_dims(pts_b[..., 1], axis=1)
+            x1e = tx1  # [B,maxb,1]
+            y1e = ty1
+            x2e = tx2
+            y2e = ty2
+            inside = tf.logical_and(tf.logical_and(pts_x >= x1e, pts_x <= x2e),
+                                     tf.logical_and(pts_y >= y1e, pts_y <= y2e))  # [B,maxb,N]
+            allow = tf.logical_and(inside, tvalid)
+            allow = tf.logical_and(allow, d_all <= radius_pix)
+            big = tf.constant(1e9, dtype=d_all.dtype)
+            d_masked = tf.where(allow, d_all, tf.fill(tf.shape(d_all), big))
+            any_ok = tf.reduce_any(allow, axis=1)  # [B,N]
+            gt_choice = tf.argmin(d_masked, axis=1, output_type=tf.int32)  # [B,N]
+            pos_pairs = tf.where(any_ok)  # [M,2] (b, n)
 
+            def _cr_additions(obj_flat):
+                b_pos = tf.cast(pos_pairs[:, 0], tf.int32)
+                n_pos = tf.cast(pos_pairs[:, 1], tf.int32)
+                g_pos = tf.gather_nd(gt_choice, pos_pairs)  # [M]
+                gi = tf.stack([b_pos, g_pos], axis=1)
+                # class one-hot
+                cls_ids_pos = tf.gather_nd(t_cls_full, gi)
+                cls_oh_pos = tf.one_hot(cls_ids_pos, depth=C)
+                # Predicted boxes for selected points (DFL decode)
+                bins = self.cfg.reg_max + 1
+                if getattr(self.cfg, 'debug_asserts', False):
+                    n_pos = self._assert_indices_in_range(n_pos, HW, name="n_pos")
+                    b_pos_checked = self._assert_indices_in_range(b_pos, tf.shape(cls_map)[0], name="b_pos")
+                else:
+                    b_pos_checked = b_pos
+                pred_reg_pts = self._gather_hw(reg_map, b_pos_checked, n_pos, name="n_pos")  # [M, 4*(R)]
+                pred_reg_pts = tf.reshape(pred_reg_pts, [-1, 4, bins])
+                dist_bins = integral_distribution(pred_reg_pts, self.cfg.reg_max) * stride  # [M,4]
+                pxy = tf.gather(pts, n_pos)  # [M,2] (no gradient to model outputs)
+                px1 = pxy[:, 0] - dist_bins[:, 0]
+                py1 = pxy[:, 1] - dist_bins[:, 1]
+                px2 = pxy[:, 0] + dist_bins[:, 2]
+                py2 = pxy[:, 1] + dist_bins[:, 3]
+                pbox = tf.stack([px1, py1, px2, py2], axis=-1)  # [M,4]
+                # GT boxes for selected pairs
+                gx1 = tf.gather_nd(tf.squeeze(tx1, -1), gi)
+                gy1 = tf.gather_nd(tf.squeeze(ty1, -1), gi)
+                gx2 = tf.gather_nd(tf.squeeze(tx2, -1), gi)
+                gy2 = tf.gather_nd(tf.squeeze(ty2, -1), gi)
+                gbox = tf.stack([gx1, gy1, gx2, gy2], axis=-1)
+                # IoU weights
+                inter_x1 = tf.maximum(pbox[:, 0], gbox[:, 0])
+                inter_y1 = tf.maximum(pbox[:, 1], gbox[:, 1])
+                inter_x2 = tf.minimum(pbox[:, 2], gbox[:, 2])
+                inter_y2 = tf.minimum(pbox[:, 3], gbox[:, 3])
+                iw = tf.maximum(0.0, inter_x2 - inter_x1)
+                ih = tf.maximum(0.0, inter_y2 - inter_y1)
+                inter = iw * ih
+                area_p = tf.maximum(0.0, (pbox[:, 2] - pbox[:, 0])) * tf.maximum(0.0, (pbox[:, 3] - pbox[:, 1]))
+                area_g = tf.maximum(0.0, (gbox[:, 2] - gbox[:, 0])) * tf.maximum(0.0, (gbox[:, 3] - gbox[:, 1]))
+                union = area_p + area_g - inter + 1e-9
+                iou_w = inter / union  # [M]
+                iou_w_sg = tf.stop_gradient(iou_w)
+                # Keep top-K by IoU; prefer GPU placement for speed
+                M = tf.shape(iou_w_sg)[0]
+                Kp = tf.minimum(M, tf.constant(self.cfg.cr_topk_limit, dtype=tf.int32))
+
+                def _do_topk():
+                    res = self._top_k(iou_w_sg, k=Kp)
+                    return res.values, res.indices
+
+                def _empty():
+                    return tf.zeros([0], dtype=iou_w.dtype), tf.zeros([0], dtype=tf.int32)
+
+                top_vals, top_idx = tf.cond(M > 0, _do_topk, _empty)
+                i_sel = top_idx
+                w = top_vals
+                b_sel = self._gather_cpu(b_pos_checked, i_sel)
+                n_pos_sel = self._gather_cpu(n_pos, i_sel)
+                if getattr(self.cfg, 'debug_asserts', False):
+                    n_pos_sel = self._assert_indices_in_range(n_pos_sel, HW, name="n_pos_sel")
+                    b_sel = self._assert_indices_in_range(b_sel, tf.shape(cls_map)[0], name="b_pos_sel")
+                pred_cls_pts = self._gather_hw(cls_map, b_sel, n_pos_sel, name="cr_idx")
+                pred_obj_pts = self._gather_hw(obj_map, b_sel, n_pos_sel, name="cr_idx")
+                cls_oh_sel = tf.gather(cls_oh_pos, i_sel)
+                cls_loss_pts = bce_with_logits_loss(pred_cls_pts, cls_oh_sel)
+                cls_loss_pts = tf.reduce_sum(
+                    cls_loss_pts * tf.where(tf.size(w) > 0, w[:, None], tf.zeros_like(cls_loss_pts))
+                ) / (tf.reduce_sum(w) + 1e-9)
+                flat_idx_cr = b_sel * HW + n_pos_sel
+                obj_flat = tf.tensor_scatter_nd_add(
+                    obj_flat,
+                    tf.expand_dims(flat_idx_cr, axis=1),
+                    tf.cast(tf.stop_gradient(w), tf.float32),
+                )
+                return cls_loss_pts, obj_flat
+
+            def _no_cr(obj_flat):
+                z = tf.constant(0.0, tf.float32)
+                return z, obj_flat
+
+            add_cls, obj_target_flat = tf.cond(
+                tf.shape(pos_pairs)[0] > 0,
+                lambda: _cr_additions(obj_target_flat),
+                lambda: _no_cr(obj_target_flat),
+            )
+            total_cls += add_cls
+
+            obj_target = tf.reshape(
+                tf.clip_by_value(obj_target_flat, 0.0, 1.0),
+                tf.stack([B, HW, tf.constant(1, dtype=tf.int32)]),
+            )
+            obj_loss_map = bce_with_logits_loss(obj_map, obj_target)
+            obj_loss = tf.reduce_mean(obj_loss_map)
+            total_obj += obj_loss
+
+        # combine losses
         loss = (
-            self.cfg.box_loss_gain * total_box
-            + self.cfg.cls_loss_gain * total_cls
+            self.cfg.cls_loss_gain * total_cls
+            + self.cfg.box_loss_gain * total_box
             + self.cfg.dfl_loss_gain * total_dfl
+            + 1.0 * total_obj
         )
 
         metrics = {
@@ -416,7 +509,7 @@ class Trainer:
             "box": tf.cast(total_box, tf.float32),
             "dfl": tf.cast(total_dfl, tf.float32),
             "pos": tf.cast(total_pos, tf.float32),
-            "obj": tf.constant(0.0, tf.float32),
+            "obj": tf.cast(total_obj, tf.float32),
         }
         return loss, metrics
 

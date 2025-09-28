@@ -86,50 +86,68 @@ class DetectHeadDFL(keras.Model):
         prior_prob = 0.01
         prior_logit = -math.log((1.0 - prior_prob) / prior_prob)
         cls_bias_init = tf.keras.initializers.Constant(prior_logit)
-        stems, cls_convs, reg_convs = [], [], []
-        cls_preds, reg_preds = [], []
+        obj_bias_init = tf.keras.initializers.Constant(prior_logit)
+        stems, cls_convs, reg_convs, obj_convs = [], [], [], []
+        cls_preds, reg_preds, obj_preds = [], [], []
         for i, c in enumerate(ch):
             stem = ConvBnSiLU(c, 1, 1, name=f"stem_{i}")
             cls_conv = keras.Sequential([ConvBnSiLU(c, 3, 1), ConvBnSiLU(c, 3, 1)], name=f"cls_conv_{i}")
             reg_conv = keras.Sequential([ConvBnSiLU(c, 3, 1), ConvBnSiLU(c, 3, 1)], name=f"reg_conv_{i}")
             cls_pred = L.Conv2D(num_classes, 1, 1, padding="same", bias_initializer=cls_bias_init, name=f"cls_pred_{i}")
             reg_pred = L.Conv2D(4 * self.bins, 1, 1, padding="same", name=f"reg_pred_{i}")
+            obj_conv = keras.Sequential([ConvBnSiLU(c, 3, 1)], name=f"obj_conv_{i}")
+            obj_pred = L.Conv2D(1, 1, 1, padding="same", bias_initializer=obj_bias_init, name=f"obj_pred_{i}")
             stems.append(stem)
             cls_convs.append(cls_conv)
             reg_convs.append(reg_conv)
+            obj_convs.append(obj_conv)
             cls_preds.append(cls_pred)
             reg_preds.append(reg_pred)
+            obj_preds.append(obj_pred)
         self.stems = stems
         self.cls_convs = cls_convs
         self.reg_convs = reg_convs
+        self.obj_convs = obj_convs
         self.cls_preds = cls_preds
         self.reg_preds = reg_preds
+        self.obj_preds = obj_preds
 
     def call(self, feats, training=False):
         cls_list = []
         reg_list = []
+        obj_list = []
         grids = []
+        # Build per-scale outputs
         for i, f in enumerate(feats):
             x = self.stems[i](f, training=training)
             cls_feat = self.cls_convs[i](x, training=training)
             reg_feat = self.reg_convs[i](x, training=training)
-            cls_out = self.cls_preds[i](cls_feat)
-            reg_out = self.reg_preds[i](reg_feat)
-            batch = tf.shape(cls_out)[0]
-            height = tf.shape(cls_out)[1]
-            width = tf.shape(cls_out)[2]
-            cls_list.append(tf.reshape(cls_out, [batch, height * width, -1]))
-            reg_list.append(tf.reshape(reg_out, [batch, height * width, -1]))
-            yy = tf.range(height, dtype=tf.float32)
-            xx = tf.range(width, dtype=tf.float32)
+            cls_out = self.cls_preds[i](cls_feat)  # [B,H,W,C]
+            reg_out = self.reg_preds[i](reg_feat)  # [B,H,W,4*bins]
+            obj_feat = self.obj_convs[i](x, training=training)
+            obj_out = self.obj_preds[i](obj_feat)  # [B,H,W,1]
+
+            B = tf.shape(cls_out)[0]
+            H = tf.shape(cls_out)[1]
+            W = tf.shape(cls_out)[2]
+
+            # Flatten to [B,HW,*]
+            cls_list.append(tf.reshape(cls_out, [B, H * W, -1]))
+            reg_list.append(tf.reshape(reg_out, [B, H * W, -1]))
+            obj_list.append(tf.reshape(obj_out, [B, H * W, -1]))
+
+            # Grid centers in pixels
+            stride = float(self.strides[i])
+            yy = tf.range(H, dtype=tf.float32)
+            xx = tf.range(W, dtype=tf.float32)
             yy, xx = tf.meshgrid(yy, xx, indexing="ij")
-            stride = tf.cast(self.strides[i], tf.float32)
-            pts = tf.stack(
-                [tf.reshape((xx + 0.5) * stride, [-1]), tf.reshape((yy + 0.5) * stride, [-1])],
-                axis=-1,
-            )
-            grids.append(pts)
-        return {"cls": cls_list, "reg": reg_list, "grids": grids, "strides": list(self.strides)}
+            gy = (yy + 0.5) * stride
+            gx = (xx + 0.5) * stride
+            grid = tf.stack([gx, gy], axis=-1)  # [H,W,2]
+            grids.append(tf.reshape(grid, [H * W, 2]))
+
+        return {"cls": cls_list, "reg": reg_list, "obj": obj_list, "grids": grids, "strides": list(self.strides)}
+
 
 def build_yolo11(num_classes, width_mult=0.50, depth_mult=0.33, reg_max=16):
     inp = L.Input(shape=(None, None, 3), name="images")
@@ -161,6 +179,4 @@ def build_yolo11(num_classes, width_mult=0.50, depth_mult=0.33, reg_max=16):
             return self.head([n3, n4, n5], training=training)
 
     return Wrapper(backbone, neck, head)
-
-
 
