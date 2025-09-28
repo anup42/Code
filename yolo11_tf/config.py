@@ -18,9 +18,16 @@ class TrainSettings:
     imgsz: int = 640
     batch: int = 16
     epochs: int = 100
-    lr0: float = 1e-3
+    lr0: float = 0.01
+    lrf: float = 0.01
+    momentum: float = 0.937
     warmup_epochs: float = 3.0
+    warmup_momentum: float = 0.8
+    warmup_bias_lr: float = 0.1
     weight_decay: float = 5e-4
+    optimizer: str = "SGD"
+    nbs: int = 64
+    cos_lr: bool = False
 
     @classmethod
     def from_dict(cls, data: Optional[Dict[str, Any]] = None) -> "TrainSettings":

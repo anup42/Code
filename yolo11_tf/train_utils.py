@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
+import math
 import numpy as np
 import tensorflow as tf
 
@@ -12,14 +13,26 @@ class TrainConfig:
     num_classes: int
     img_size: int = 640
     reg_max: int = 16
-    lr: float = 1e-3
+    lr0: float = 0.01
+    lrf: float = 0.01
+    momentum: float = 0.937
+    warmup_epochs: float = 3.0
+    warmup_momentum: float = 0.8
+    warmup_bias_lr: float = 0.1
     weight_decay: float = 5e-4
+    optimizer: str = "SGD"
+    batch_size: int = 16
+    nbs: int = 64
+    cos_lr: bool = False
     epochs: int = 100
-    warmup_epochs: int = 3
     cls_loss_gain: float = 1.0
     box_loss_gain: float = 7.5
     dfl_loss_gain: float = 1.5
     max_boxes: int = 300
+    conf_thres: float = 0.001
+    iou_thres: float = 0.7
+    max_det: int = 300
+    lr: float | None = None  # Deprecated alias for lr0
     # Performance/stability knobs
     prefer_gpu_ops: bool = True
     debug_asserts: bool = False
@@ -35,12 +48,49 @@ class Trainer:
     ):
         self.model = model
         self.cfg = cfg
+        if self.cfg.lr is not None:
+            # Backwards compatibility for older configuration objects.
+            self.cfg.lr0 = self.cfg.lr
         self.strategy = strategy or tf.distribute.get_strategy()
         self._num_replicas = max(1, int(getattr(self.strategy, "num_replicas_in_sync", 1)))
-        if cfg.weight_decay > 0:
-            self.optimizer = tf.keras.optimizers.AdamW(learning_rate=cfg.lr, weight_decay=cfg.weight_decay)
+
+        # Optimizer and scheduler configuration that mirrors the Ultralytics defaults
+        base_lr = float(self.cfg.lr0)
+        if self.cfg.batch_size and self.cfg.nbs:
+            base_lr *= float(self.cfg.batch_size) / float(self.cfg.nbs)
+        self.base_lr = base_lr
+        self._lr_var = tf.Variable(base_lr, dtype=tf.float32, trainable=False, name="train_lr")
+
+        opt_name = (self.cfg.optimizer or "sgd").lower()
+        self._momentum_var = None
+        if opt_name == "sgd":
+            self._momentum_var = tf.Variable(self.cfg.momentum, dtype=tf.float32, trainable=False, name="train_momentum")
+            self.optimizer = tf.keras.optimizers.SGD(
+                learning_rate=self._lr_var,
+                momentum=self._momentum_var,
+                nesterov=True,
+            )
+        elif opt_name == "adamw":
+            self.optimizer = tf.keras.optimizers.AdamW(learning_rate=self._lr_var, weight_decay=self.cfg.weight_decay)
+        elif opt_name == "adam":
+            self.optimizer = tf.keras.optimizers.Adam(learning_rate=self._lr_var)
         else:
-            self.optimizer = tf.keras.optimizers.Adam(learning_rate=cfg.lr)
+            if self.cfg.weight_decay > 0:
+                self.optimizer = tf.keras.optimizers.AdamW(learning_rate=self._lr_var, weight_decay=self.cfg.weight_decay)
+            else:
+                self.optimizer = tf.keras.optimizers.Adam(learning_rate=self._lr_var)
+
+        # Track which variables receive weight decay when emulating SGD training.
+        if self.cfg.weight_decay > 0 and opt_name == "sgd":
+            self._decay_mask = []
+            for var in self.model.trainable_variables:
+                name = var.name.lower()
+                mask = not any(token in name for token in ("bias", "bn", "norm", "gamma", "beta"))
+                self._decay_mask.append(mask)
+        else:
+            self._decay_mask = [False] * len(self.model.trainable_variables)
+
+        self._lr_lambda = self._build_lr_lambda()
         # Training state for checkpointing/resume support
         self._epoch = tf.Variable(0, dtype=tf.int32, trainable=False, name="epoch")
         self._global_step = tf.Variable(0, dtype=tf.int64, trainable=False, name="global_step")
@@ -71,6 +121,60 @@ class Trainer:
         else:
             status.assert_existing_objects_matched()
         return status
+
+    def _build_lr_lambda(self):
+        epochs = max(float(self.cfg.epochs), 1.0)
+
+        def _clip_epoch(x: float) -> float:
+            return min(max(x, 0.0), epochs)
+
+        if self.cfg.cos_lr:
+            return lambda x: ((1.0 - math.cos(math.pi * _clip_epoch(x) / epochs)) / 2.0) * (self.cfg.lrf - 1.0) + 1.0
+        return lambda x: (1.0 - _clip_epoch(x) / epochs) * (1.0 - self.cfg.lrf) + self.cfg.lrf
+
+    def lr_factor(self, epoch_progress: float) -> float:
+        """Return the scheduler multiplier for a given fractional epoch."""
+        return float(self._lr_lambda(epoch_progress))
+
+    def set_learning_rate(self, value: float):
+        lr = getattr(self.optimizer, "learning_rate", None)
+        if hasattr(lr, "assign"):
+            lr.assign(float(value))
+        else:
+            self.optimizer.learning_rate = float(value)
+
+    def set_momentum(self, value: float):
+        if hasattr(self.optimizer, "momentum"):
+            mom = self.optimizer.momentum
+            if hasattr(mom, "assign"):
+                mom.assign(float(value))
+            else:
+                try:
+                    self.optimizer.momentum = float(value)
+                except AttributeError:
+                    pass
+
+    def current_learning_rate(self) -> float:
+        lr = getattr(self.optimizer, "learning_rate", None)
+        if lr is None:
+            return float(self.base_lr)
+        if hasattr(lr, "numpy"):
+            return float(lr.numpy())
+        try:
+            return float(lr)
+        except (TypeError, ValueError):
+            return float(self.base_lr)
+
+    def current_momentum(self) -> float:
+        if hasattr(self.optimizer, "momentum"):
+            mom = self.optimizer.momentum
+            if hasattr(mom, "numpy"):
+                return float(mom.numpy())
+            try:
+                return float(mom)
+            except (TypeError, ValueError):
+                pass
+        return float(self.cfg.momentum)
 
     def _gather_cpu(self, x, indices, batch_dims=0):
         if getattr(self.cfg, 'prefer_gpu_ops', True):
@@ -586,6 +690,13 @@ class Trainer:
 
         if all_none:
             return metrics
+
+        if self.cfg.weight_decay > 0 and any(self._decay_mask):
+            decay = tf.cast(self.cfg.weight_decay, processed_grads[0].dtype)
+            processed_grads = [
+                grad + decay * var if mask else grad
+                for grad, var, mask in zip(processed_grads, self.model.trainable_variables, self._decay_mask)
+            ]
 
         self.optimizer.apply_gradients(zip(processed_grads, self.model.trainable_variables))
 
